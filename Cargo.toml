@@ -1,0 +1,30 @@
+[package]
+name = "rust_oberon"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Rust Oberon - an open source real-time strategy game similar to Dark Oberon"
+
+[dependencies]
+bevy = { version = "0.16", default-features = false, features = [
+    "bevy_log",
+    "bevy_core_pipeline",
+    "bevy_sprite",
+    "bevy_text",
+    "default_font",
+    "bevy_winit",
+    "bevy_window",
+    "png",
+    "x11",
+    "multi_threaded",
+] }
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true
+panic = "abort"
+
+# Bevy needs real optimization; the workspace default ("z") is for the small CLI libs.
+[profile.dev.package."*"]
+opt-level = 2
