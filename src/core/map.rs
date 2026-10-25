@@ -5,13 +5,17 @@ use std::collections::BinaryHeap;
 
 use bevy::prelude::*;
 
-use crate::core::{mapfile::MapFile, scheme::{Scheme, TerrainProps}};
+use crate::core::{
+    mapfile::MapFile,
+    scheme::{Scheme, TerrainProps},
+};
 
 #[derive(Resource, Debug, Clone, Default)]
 pub struct NavigationGrid {
     pub width: u32,
     pub height: u32,
     walkable: Vec<bool>,
+    reserved: Vec<bool>,
 }
 
 impl NavigationGrid {
@@ -22,7 +26,7 @@ impl NavigationGrid {
             return Self::default();
         };
         let terrain_types = scheme.segments.get(1).map(|segment| &segment.terrains);
-        let walkable = surface
+        let walkable: Vec<bool> = surface
             .iter()
             .map(|&terrain_id| {
                 terrain_types
@@ -31,14 +35,48 @@ impl NavigationGrid {
             })
             .collect();
 
-        Self { width: map.width, height: map.height, walkable }
+        let reserved = vec![false; walkable.len()];
+        Self {
+            width: map.width,
+            height: map.height,
+            walkable,
+            reserved,
+        }
     }
 
     pub fn is_walkable(&self, cell: IVec2) -> bool {
+        self.is_terrain_walkable(cell) && !self.reserved[self.cell_index(cell)]
+    }
+
+    pub fn is_terrain_walkable(&self, cell: IVec2) -> bool {
         if cell.x < 0 || cell.y < 0 || cell.x >= self.width as i32 || cell.y >= self.height as i32 {
             return false;
         }
-        self.walkable[(cell.y as u32 * self.width + cell.x as u32) as usize]
+        self.walkable[self.cell_index(cell)]
+    }
+
+    pub fn can_reserve_footprint(&self, origin: IVec2, size: IVec2) -> bool {
+        size.x > 0
+            && size.y > 0
+            && (origin.y..origin.y + size.y)
+                .all(|y| (origin.x..origin.x + size.x).all(|x| self.is_walkable(IVec2::new(x, y))))
+    }
+
+    pub fn reserve_footprint(&mut self, origin: IVec2, size: IVec2) -> bool {
+        if !self.can_reserve_footprint(origin, size) {
+            return false;
+        }
+        for y in origin.y..origin.y + size.y {
+            for x in origin.x..origin.x + size.x {
+                let index = self.cell_index(IVec2::new(x, y));
+                self.reserved[index] = true;
+            }
+        }
+        true
+    }
+
+    fn cell_index(&self, cell: IVec2) -> usize {
+        (cell.y as u32 * self.width + cell.x as u32) as usize
     }
 
     pub fn world_to_cell(&self, world: Vec2) -> IVec2 {
@@ -66,8 +104,8 @@ impl NavigationGrid {
                 if !self.is_walkable(cell) {
                     continue;
                 }
-                let distance = i64::from(x - requested.x).pow(2)
-                    + i64::from(y - requested.y).pow(2);
+                let distance =
+                    i64::from(x - requested.x).pow(2) + i64::from(y - requested.y).pow(2);
                 if best.is_none_or(|(best_distance, _)| distance < best_distance) {
                     best = Some((distance, cell));
                 }
@@ -95,8 +133,14 @@ impl NavigationGrid {
         frontier.push(Reverse((heuristic(start, goal), start_idx)));
 
         const NEIGHBORS: [(i32, i32); 8] = [
-            (-1, 0), (1, 0), (0, -1), (0, 1),
-            (-1, -1), (-1, 1), (1, -1), (1, 1),
+            (-1, 0),
+            (1, 0),
+            (0, -1),
+            (0, 1),
+            (-1, -1),
+            (-1, 1),
+            (1, -1),
+            (1, 1),
         ];
 
         while let Some(Reverse((_, current_idx))) = frontier.pop() {
@@ -123,7 +167,8 @@ impl NavigationGrid {
                 if !self.is_walkable(next) {
                     continue;
                 }
-                if dx != 0 && dy != 0
+                if dx != 0
+                    && dy != 0
                     && (!self.is_walkable(current + IVec2::new(dx, 0))
                         || !self.is_walkable(current + IVec2::new(0, dy)))
                 {
@@ -145,11 +190,40 @@ impl NavigationGrid {
 }
 
 fn terrain_is_walkable(terrain: &TerrainProps) -> bool {
-    !matches!(terrain.name.to_ascii_lowercase().as_str(), "sea" | "unmoveable" | "nonexist")
+    !matches!(
+        terrain.name.to_ascii_lowercase().as_str(),
+        "sea" | "unmoveable" | "nonexist"
+    )
 }
 
 fn heuristic(a: IVec2, b: IVec2) -> u32 {
     let dx = (a.x - b.x).unsigned_abs();
     let dy = (a.y - b.y).unsigned_abs();
     14 * dx.min(dy) + 10 * (dx.max(dy) - dx.min(dy))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reserved_footprint_is_blocked_and_pathfinding_detours() {
+        let mut grid = NavigationGrid {
+            width: 5,
+            height: 5,
+            walkable: vec![true; 25],
+            reserved: vec![false; 25],
+        };
+        let origin = IVec2::new(2, 1);
+        let size = IVec2::new(1, 3);
+
+        assert!(grid.can_reserve_footprint(origin, size));
+        assert!(grid.reserve_footprint(origin, size));
+        assert!(!grid.is_walkable(IVec2::new(2, 2)));
+
+        let path = grid.find_path(IVec2::new(0, 2), IVec2::new(4, 2)).unwrap();
+        assert!(path
+            .iter()
+            .all(|cell| cell.x != 2 || !(1..4).contains(&cell.y)));
+    }
 }

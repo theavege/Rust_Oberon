@@ -63,6 +63,42 @@ pub struct PlayerEconomy {
     pub wood: u32,
 }
 
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct ShedDefinition {
+    pub footprint: IVec2,
+    pub wood_cost: u32,
+    pub construction_seconds: f32,
+}
+
+impl Default for ShedDefinition {
+    fn default() -> Self {
+        Self {
+            footprint: IVec2::new(2, 2),
+            wood_cost: 12,
+            construction_seconds: 8.0,
+        }
+    }
+}
+
+#[derive(Component, Debug)]
+pub struct Building {
+    pub owner: u8,
+    pub footprint: IVec2,
+}
+
+#[derive(Component, Debug)]
+pub struct ConstructionSite {
+    pub elapsed: f32,
+    pub duration: f32,
+}
+
+#[derive(Resource, Debug, Default)]
+pub struct ShedPlacement {
+    pub active: bool,
+    pub origin: IVec2,
+    pub valid: bool,
+}
+
 /// Unit position in isometric world coordinates, owned by the simulation.
 #[derive(Component, Debug, Clone, Copy)]
 pub struct WorldPosition(pub Vec2);
@@ -85,4 +121,5 @@ pub enum PlayerCommand {
     Select(Option<Entity>),
     MoveSelected(Vec2),
     Harvest(Entity),
+    PlaceShed(IVec2),
 }

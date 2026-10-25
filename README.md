@@ -21,17 +21,9 @@ Rust Oberon is an open-source real-time strategy game written in Rust, inspired 
 5. **Persistence and content tools** — add save/load, map/content validation, error reporting and contributor workflows for maps and definitions.
 6. **Polish and release** — improve input/UI/audio, performance on larger battles, packaging, documentation, accessibility and release/license notices.
 
-### Next step: build a Shed
+### Shed construction slice (complete)
 
-Add one complete construction flow that uses the wood harvested in the current prototype. Use the original Shed build and idle sprites (`assets/do/human/shed_build/` and `assets/do/human/shed_stay/`); keep its prototype cost, footprint and build duration in data so they can be tuned without changing simulation systems.
-
-1. Add a building definition with owner, footprint, wood cost and construction duration.
-2. Press **B** to enter placement mode. Show a Shed preview snapped to the map grid; color it green on a valid site and red on an invalid site. **Escape** or right-click cancels placement.
-3. Validate the whole footprint against map bounds, walkable terrain, existing buildings and units. Deduct wood only after a valid placement is accepted.
-4. Create a construction site with visible progress, then replace it with the completed Shed using the idle sprite.
-5. Reserve the footprint for navigation as soon as construction begins; units must not route through a site or completed building.
-
-Acceptance: a player with enough wood can place a Shed on clear land, see it finish construction, and move units around its reserved footprint. Invalid placement must spend no wood; insufficient wood must prevent placement.
+Press **B** to place a Shed using harvested wood. The grid-snapped preview is green on a valid site and red otherwise; left-click places it, while **Escape** or right-click cancels. Placement checks the full footprint against map bounds, terrain, other buildings and units. The footprint is reserved for navigation immediately, construction progress is visible, and the completed Shed uses the original idle sprite. Invalid sites and insufficient wood cannot spend resources. Footprint, wood cost and construction duration are set by `ShedDefinition`.
 
 ### First milestone acceptance checklist
 
@@ -50,7 +42,7 @@ Requires Rust and Cargo. From the repository root:
 cargo run
 ```
 
-Controls: **WASD / arrow keys** to pan, **left-click** a unit to select (empty ground clears selection), **right-click** open ground to move, and **right-click** a tree with a Peasant selected to harvest wood.
+Controls: **WASD / arrow keys** to pan, **left-click** a unit to select (empty ground clears selection), **right-click** open ground to move, and **right-click** a tree with a Peasant selected to harvest wood. Press **B** to place a Shed; **left-click** a valid site, or cancel with **Escape** / right-click.
 
 ## Architecture
 

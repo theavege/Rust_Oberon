@@ -8,8 +8,8 @@ use bevy::prelude::*;
 use crate::core::{
     map::NavigationGrid,
     units::{
-        HarvestOrder, MovePath, Player, PlayerCommand, PlayerEconomy, ResourceNode, Selected,
-        Unit, UnitKind, WorldPosition,
+        Building, ConstructionSite, HarvestOrder, MovePath, Player, PlayerCommand, PlayerEconomy,
+        ResourceNode, Selected, ShedDefinition, ShedPlacement, Unit, UnitKind, WorldPosition,
     },
 };
 
@@ -19,10 +19,14 @@ impl Plugin for SimPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, setup::spawn_initial_units)
             .add_event::<PlayerCommand>()
-            .add_systems(Update, apply_player_commands)
+            .add_systems(Update, (apply_player_commands, update_shed_placement))
             .add_systems(
                 FixedUpdate,
-                (movement_system, harvest_system.after(movement_system)),
+                (
+                    movement_system,
+                    harvest_system.after(movement_system),
+                    construction_system.after(harvest_system),
+                ),
             );
     }
 }
@@ -30,7 +34,9 @@ impl Plugin for SimPlugin {
 fn apply_player_commands(
     mut messages: EventReader<PlayerCommand>,
     mut commands: Commands,
-    navigation: Res<NavigationGrid>,
+    mut navigation: ResMut<NavigationGrid>,
+    mut economy: ResMut<PlayerEconomy>,
+    shed: Res<ShedDefinition>,
     units: Query<
         (Entity, &Unit, Option<&Selected>, &WorldPosition),
         (With<Player>, Without<ResourceNode>),
@@ -80,12 +86,92 @@ fn apply_player_commands(
                         .unwrap_or_default();
                     commands.entity(entity).insert((
                         MovePath(path.into()),
-                        HarvestOrder { target, elapsed: 0.0 },
+                        HarvestOrder {
+                            target,
+                            elapsed: 0.0,
+                        },
                     ));
                 }
             }
+            PlayerCommand::PlaceShed(origin) => {
+                let occupied_cells: Vec<IVec2> = units
+                    .iter()
+                    .map(|(_, _, _, position)| navigation.world_to_cell(position.0))
+                    .collect();
+                if economy.wood < shed.wood_cost
+                    || !can_place_shed(&navigation, origin, shed.footprint, &occupied_cells)
+                    || !navigation.reserve_footprint(origin, shed.footprint)
+                {
+                    continue;
+                }
+
+                economy.wood -= shed.wood_cost;
+                commands.spawn((
+                    Building {
+                        owner: 0,
+                        footprint: shed.footprint,
+                    },
+                    ConstructionSite {
+                        elapsed: 0.0,
+                        duration: shed.construction_seconds.max(0.1),
+                    },
+                    WorldPosition(footprint_center(origin, shed.footprint)),
+                ));
+            }
         }
     }
+}
+
+fn can_place_shed(
+    navigation: &NavigationGrid,
+    origin: IVec2,
+    footprint: IVec2,
+    occupied_cells: &[IVec2],
+) -> bool {
+    navigation.can_reserve_footprint(origin, footprint)
+        && !occupied_cells
+            .iter()
+            .any(|&cell| footprint_contains(origin, footprint, cell))
+}
+
+fn footprint_contains(origin: IVec2, footprint: IVec2, cell: IVec2) -> bool {
+    cell.x >= origin.x
+        && cell.y >= origin.y
+        && cell.x < origin.x + footprint.x
+        && cell.y < origin.y + footprint.y
+}
+
+fn footprint_center(origin: IVec2, footprint: IVec2) -> Vec2 {
+    let offset = Vec2::new(
+        (footprint.x - 1) as f32 / 2.0,
+        (footprint.y - 1) as f32 / 2.0,
+    );
+    NavigationGrid::cell_center(origin)
+        + Vec2::new(16.0 * (offset.x - offset.y), -8.0 * (offset.x + offset.y))
+}
+
+fn update_shed_placement(
+    navigation: Res<NavigationGrid>,
+    economy: Res<PlayerEconomy>,
+    shed: Res<ShedDefinition>,
+    units: Query<&WorldPosition, (With<Unit>, With<Player>, Without<ResourceNode>)>,
+    mut placement: ResMut<ShedPlacement>,
+) {
+    if !placement.active {
+        placement.valid = false;
+        return;
+    }
+    let occupied_cells: Vec<IVec2> = units
+        .iter()
+        .map(|position| navigation.world_to_cell(position.0))
+        .collect();
+    placement.valid = economy.wood >= shed.wood_cost
+        && can_place_shed(
+            &navigation,
+            placement.origin,
+            shed.footprint,
+            &occupied_cells,
+        );
 }
 
 fn harvest_system(
@@ -120,9 +206,23 @@ fn harvest_system(
     }
 }
 
+fn construction_system(
+    time: Res<Time<Fixed>>,
+    mut commands: Commands,
+    mut sites: Query<(Entity, &mut ConstructionSite)>,
+) {
+    for (entity, mut site) in &mut sites {
+        site.elapsed += time.delta_secs();
+        if site.elapsed >= site.duration {
+            commands.entity(entity).remove::<ConstructionSite>();
+        }
+    }
+}
+
 /// Move units toward their current destination in isometric world space.
 fn movement_system(
     time: Res<Time<Fixed>>,
+    navigation: Res<NavigationGrid>,
     mut q: Query<(&mut WorldPosition, &Unit, &mut MovePath), With<Player>>,
 ) {
     let dt = time.delta_secs();
@@ -131,6 +231,16 @@ fn movement_system(
             continue;
         };
         let pos = position.0;
+        let current_cell = navigation.world_to_cell(pos);
+        let diagonal = current_cell.x != next_cell.x && current_cell.y != next_cell.y;
+        if !navigation.is_walkable(next_cell)
+            || (diagonal
+                && (!navigation.is_walkable(IVec2::new(next_cell.x, current_cell.y))
+                    || !navigation.is_walkable(IVec2::new(current_cell.x, next_cell.y))))
+        {
+            path.0.clear();
+            continue;
+        }
         let target = NavigationGrid::cell_center(next_cell);
         let delta = target - pos;
         let dist = delta.length();

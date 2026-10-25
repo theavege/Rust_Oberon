@@ -18,12 +18,18 @@ impl Plugin for RenderPlugin {
                 (
                     camera::camera_pan,
                     units_view::unit_input,
-                units_view::sync_resource_nodes,
-                units_view::sync_resource_transforms,
+                    units_view::shed_placement_input,
+                    units_view::sync_shed_placement_preview,
+                    units_view::sync_shed_sprites,
+                    units_view::animate_shed_sprites,
+                    units_view::complete_shed_visuals,
+                    units_view::sync_construction_progress,
+                    units_view::sync_resource_nodes,
+                    units_view::sync_resource_transforms,
                     units_view::sync_unit_sprites,
                     units_view::sync_unit_transforms,
                     units_view::show_selection,
-                units_view::sync_economy_hud,
+                    units_view::sync_economy_hud,
                 ),
             );
     }

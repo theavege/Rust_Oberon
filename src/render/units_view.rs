@@ -1,9 +1,12 @@
 //! Project simulation-owned unit positions and selection state into visuals.
 
 use bevy::prelude::*;
+use bevy::sprite::Anchor;
 
+use crate::core::map::NavigationGrid;
 use crate::core::units::{
-    Player, PlayerCommand, PlayerEconomy, ResourceNode, Selected, Unit, WorldPosition,
+    Building, ConstructionSite, Player, PlayerCommand, PlayerEconomy, ResourceNode, Selected,
+    ShedDefinition, ShedPlacement, Unit, WorldPosition,
 };
 
 /// Marker for unit visuals so we can find unsynced entities.
@@ -57,11 +60,205 @@ pub fn unit_input(
     }
 }
 
+pub fn shed_placement_input(
+    buttons: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    navigation: Res<NavigationGrid>,
+    mut placement: ResMut<ShedPlacement>,
+    windows: Query<&Window>,
+    cameras: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
+    mut commands: EventWriter<PlayerCommand>,
+) {
+    if keys.just_pressed(KeyCode::KeyB) {
+        placement.active = true;
+    }
+    if keys.just_pressed(KeyCode::Escape) {
+        placement.active = false;
+        return;
+    }
+    if placement.active && buttons.just_pressed(MouseButton::Right) {
+        placement.active = false;
+        return;
+    }
+    if !placement.active {
+        return;
+    }
+
+    let Ok(window) = windows.single() else { return };
+    let Some(cursor) = window.cursor_position() else {
+        return;
+    };
+    let Ok((camera, camera_transform)) = cameras.single() else {
+        return;
+    };
+    let Ok(world_pos) = camera.viewport_to_world_2d(camera_transform, cursor) else {
+        return;
+    };
+
+    let origin = navigation.world_to_cell(world_pos);
+    placement.origin = origin;
+    if buttons.just_pressed(MouseButton::Left) && placement.valid {
+        commands.write(PlayerCommand::PlaceShed(origin));
+        placement.active = false;
+    }
+}
+
+#[derive(Component)]
+pub struct ShedPlacementPreview;
+
+pub fn sync_shed_placement_preview(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    shed: Res<ShedDefinition>,
+    placement: Res<ShedPlacement>,
+    mut previews: Query<(Entity, &mut Sprite, &mut Transform), With<ShedPlacementPreview>>,
+) {
+    let Ok((entity, mut sprite, mut transform)) = previews.single_mut() else {
+        if placement.active {
+            let position = footprint_center(placement.origin, shed.footprint);
+            commands.spawn((
+                Sprite {
+                    image: asset_server.load("do/human/shed_build/shed_build1.png"),
+                    color: placement_color(placement.valid),
+                    custom_size: Some(Vec2::new(100.0, 64.0)),
+                    ..default()
+                },
+                Transform::from_xyz(position.x, position.y, 2.0),
+                ShedPlacementPreview,
+            ));
+        }
+        return;
+    };
+
+    if !placement.active {
+        commands.entity(entity).despawn();
+        return;
+    }
+    let position = footprint_center(placement.origin, shed.footprint);
+    sprite.color = placement_color(placement.valid);
+    transform.translation.x = position.x;
+    transform.translation.y = position.y;
+}
+
+fn placement_color(valid: bool) -> Color {
+    if valid {
+        Color::srgba(0.2, 1.0, 0.25, 0.7)
+    } else {
+        Color::srgba(1.0, 0.18, 0.14, 0.7)
+    }
+}
+
+fn footprint_center(origin: IVec2, footprint: IVec2) -> Vec2 {
+    let offset = Vec2::new(
+        (footprint.x - 1) as f32 / 2.0,
+        (footprint.y - 1) as f32 / 2.0,
+    );
+    NavigationGrid::cell_center(origin)
+        + Vec2::new(16.0 * (offset.x - offset.y), -8.0 * (offset.x + offset.y))
+}
+
 #[derive(Component)]
 pub struct ResourceNodeSprite;
 
 #[derive(Component)]
 pub struct EconomyHud;
+
+#[derive(Component)]
+pub struct BuildingSprite {
+    frame: usize,
+    completed: bool,
+}
+
+#[derive(Component)]
+pub struct ConstructionProgressLabel(Entity);
+
+pub fn sync_shed_sprites(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    buildings: Query<
+        (Entity, &WorldPosition, Option<&ConstructionSite>),
+        (With<Building>, Without<BuildingSprite>),
+    >,
+) {
+    for (entity, position, site) in &buildings {
+        let image = if site.is_some() {
+            "do/human/shed_build/shed_build1.png"
+        } else {
+            "do/human/shed_stay/shed_stay1.png"
+        };
+        commands.entity(entity).insert((
+            Sprite {
+                image: asset_server.load(image),
+                ..default()
+            },
+            Transform::from_xyz(position.0.x, position.0.y, 1.2),
+            BuildingSprite {
+                frame: 0,
+                completed: site.is_none(),
+            },
+        ));
+        if site.is_some() {
+            commands.spawn((
+                Text2d::new("Building Shed 0%"),
+                TextFont {
+                    font_size: 14.0,
+                    ..default()
+                },
+                TextColor(Color::WHITE),
+                Anchor::Center,
+                Transform::from_xyz(position.0.x, position.0.y + 56.0, 2.0),
+                ConstructionProgressLabel(entity),
+            ));
+        }
+    }
+}
+
+pub fn animate_shed_sprites(
+    asset_server: Res<AssetServer>,
+    mut buildings: Query<(&ConstructionSite, &mut Sprite, &mut BuildingSprite)>,
+) {
+    for (site, mut sprite, mut visual) in &mut buildings {
+        let progress = (site.elapsed / site.duration).clamp(0.0, 1.0);
+        let frame = ((progress * 3.0) as usize).min(2);
+        if frame != visual.frame {
+            visual.frame = frame;
+            sprite.image =
+                asset_server.load(format!("do/human/shed_build/shed_build{}.png", frame + 1));
+        }
+    }
+}
+
+pub fn complete_shed_visuals(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut buildings: Query<(&mut Sprite, &mut BuildingSprite), Without<ConstructionSite>>,
+    labels: Query<(Entity, &ConstructionProgressLabel)>,
+    sites: Query<(), With<ConstructionSite>>,
+) {
+    for (mut sprite, mut visual) in &mut buildings {
+        if !visual.completed {
+            sprite.image = asset_server.load("do/human/shed_stay/shed_stay1.png");
+            visual.completed = true;
+        }
+    }
+    for (entity, label) in &labels {
+        if sites.get(label.0).is_err() {
+            commands.entity(entity).despawn();
+        }
+    }
+}
+
+pub fn sync_construction_progress(
+    mut labels: Query<(&ConstructionProgressLabel, &mut Text2d)>,
+    sites: Query<&ConstructionSite>,
+) {
+    for (label, mut text) in &mut labels {
+        if let Ok(site) = sites.get(label.0) {
+            let percent = (100.0 * site.elapsed / site.duration).floor() as u32;
+            text.0 = format!("Building Shed {percent}%");
+        }
+    }
+}
 
 pub fn sync_resource_nodes(
     mut commands: Commands,
