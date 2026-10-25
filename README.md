@@ -25,6 +25,18 @@ Rust Oberon is an open-source real-time strategy game written in Rust, inspired 
 
 Press **B** to place a Shed using harvested wood. The grid-snapped preview is green on a valid site and red otherwise; left-click places it, while **Escape** or right-click cancels. Placement checks the full footprint against map bounds, terrain, other buildings and units. The footprint is reserved for navigation immediately, construction progress is visible, and the completed Shed uses the original idle sprite. Invalid sites and insufficient wood cannot spend resources. Footprint, wood cost and construction duration are set by `ShedDefinition`.
 
+### Next step: combat foundations
+
+Build a small, testable combat slice before adding an enemy opponent:
+
+1. Add data-driven damage, range and attack cooldown values for unit kinds.
+2. Add an attack command and target handling. Units move into range, attack on cooldown, and stop when the target is dead or invalid.
+3. Apply damage and remove units at zero health in the fixed-step simulation, independently of rendering.
+4. Add clear visual feedback for health and death.
+5. Test attack range, cooldown, damage, death and cancelled or invalid targets.
+
+Done when a player unit can attack an enemy, the enemy takes damage and is removed at zero health, and simulation tests cover those rules. Then add a basic opponent that can attack back.
+
 ### First milestone acceptance checklist
 
 - [x] Original map and terrain are visible at a useful scale.
