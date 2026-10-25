@@ -34,7 +34,10 @@ pub struct Manifest {
 
 impl Manifest {
     pub fn parse(src: &str) -> Result<Self, String> {
-        let mut p = P { b: src.as_bytes(), i: 0 };
+        let mut p = P {
+            b: src.as_bytes(),
+            i: 0,
+        };
         p.skip_ws();
         p.expect(b'{')?;
         let mut m = Manifest::default();
@@ -64,7 +67,10 @@ impl Manifest {
 
 fn group(p: &mut P) -> Result<GroupEntry, String> {
     p.expect(b'{')?;
-    let mut g = GroupEntry { name: String::new(), textures: Vec::new() };
+    let mut g = GroupEntry {
+        name: String::new(),
+        textures: Vec::new(),
+    };
     loop {
         p.skip_ws();
         if p.peek() == Some(b'}') {

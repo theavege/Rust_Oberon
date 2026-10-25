@@ -8,8 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
-use bevy::prelude::*;
 use bevy::log::{error, info};
+use bevy::prelude::*;
 
 use crate::core::datamanifest::Manifest;
 use crate::core::mapfile::MapFile;
@@ -36,10 +36,7 @@ pub struct GameState {
 fn find_assets_dir() -> Option<PathBuf> {
     let mut dir = std::env::current_dir().ok()?;
     loop {
-        for cand in [
-            dir.join("assets/do"),
-            dir.join("rust_oberon/assets/do"),
-        ] {
+        for cand in [dir.join("assets/do"), dir.join("rust_oberon/assets/do")] {
             if cand.exists() {
                 return Some(cand);
             }
@@ -72,7 +69,8 @@ impl GameState {
             .find(|p| p.exists())
             .cloned()
             .ok_or("plastic.sch not found")?;
-        let scheme = Scheme::parse(&std::fs::read_to_string(&sch_path).map_err(|e| format!("sch: {e}"))?)?;
+        let scheme =
+            Scheme::parse(&std::fs::read_to_string(&sch_path).map_err(|e| format!("sch: {e}"))?)?;
 
         let map_candidates = [
             do_root.join("maps").join(format!("{map_name}.map")),
@@ -84,9 +82,17 @@ impl GameState {
             .find(|p| p.exists())
             .cloned()
             .ok_or(format!("{map_name}.map not found"))?;
-        let map = MapFile::parse(&std::fs::read_to_string(&map_path).map_err(|e| format!("map: {e}"))?, &scheme)?;
+        let map = MapFile::parse(
+            &std::fs::read_to_string(&map_path).map_err(|e| format!("map: {e}"))?,
+            &scheme,
+        )?;
 
-        Ok(Self { scheme, manifest, map, asset_dir })
+        Ok(Self {
+            scheme,
+            manifest,
+            map,
+            asset_dir,
+        })
     }
 
     /// Texture group index as C `ReadTextureGroup` would resolve it.
@@ -135,8 +141,7 @@ pub fn init_game_state(
                 gs.scheme.name
             );
             commands.insert_resource(crate::core::map::NavigationGrid::from_map(
-                &gs.map,
-                &gs.scheme,
+                &gs.map, &gs.scheme,
             ));
             commands.insert_resource(gs);
         }

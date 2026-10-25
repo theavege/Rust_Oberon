@@ -10,13 +10,22 @@ pub fn dbg_parse() {
     let mut steps = 0usize;
     while let Some(tok) = r.peek().cloned() {
         steps += 1;
-        if steps > 20000 { panic!("runaway"); }
+        if steps > 20000 {
+            panic!("runaway");
+        }
         match tok {
             Tok::Word(w) => {
                 if w == "name" || w == "author" {
                     let is_str = matches!(r.toks.get(r.pos + 1), Some(Tok::Str(_)));
-                    if is_str { r.pos += 1; let _ = r.str(); } else { r.pos += 1; }
-                } else { r.pos += 1; }
+                    if is_str {
+                        r.pos += 1;
+                        let _ = r.str();
+                    } else {
+                        r.pos += 1;
+                    }
+                } else {
+                    r.pos += 1;
+                }
             }
             Tok::Open(name) if name == "Materials" => {
                 eprintln!("T{steps}: Materials at {}", r.pos);
@@ -24,8 +33,14 @@ pub fn dbg_parse() {
                 // read_kv_int count: scan up to 8
                 for _ in 0..8 {
                     match r.peek().cloned() {
-                        Some(Tok::Word(k)) if k == "count" => { r.pos += 1; let _ = r.int(); break; }
-                        Some(Tok::Word(_)) => { r.pos += 2; }
+                        Some(Tok::Word(k)) if k == "count" => {
+                            r.pos += 1;
+                            let _ = r.int();
+                            break;
+                        }
+                        Some(Tok::Word(_)) => {
+                            r.pos += 2;
+                        }
                         _ => break,
                     }
                 }
@@ -36,17 +51,32 @@ pub fn dbg_parse() {
                             r.pos += 1;
                             loop {
                                 match r.peek().cloned() {
-                                    Some(Tok::Word(_)) => { r.pos += 1; let _ = r.word(); /* value consumption varies */ 
+                                    Some(Tok::Word(_)) => {
+                                        r.pos += 1;
+                                        let _ = r.word(); /* value consumption varies */
                                         // real code per-key consumes; emulate by consuming next Str or int Word
                                         match r.peek().cloned() {
-                                            Some(Tok::Str(_)) => { r.pos += 1; }
-                                            Some(Tok::Word(x)) => { if x=="none" { r.pos+=1; } else { r.pos+=1; } }
+                                            Some(Tok::Str(_)) => {
+                                                r.pos += 1;
+                                            }
+                                            Some(Tok::Word(x)) => {
+                                                if x == "none" {
+                                                    r.pos += 1;
+                                                } else {
+                                                    r.pos += 1;
+                                                }
+                                            }
                                             _ => {}
                                         }
                                     }
-                                    Some(Tok::Close(_)) => { r.pos += 1; break; }
+                                    Some(Tok::Close(_)) => {
+                                        r.pos += 1;
+                                        break;
+                                    }
                                     None => break,
-                                    _ => { r.pos += 1; }
+                                    _ => {
+                                        r.pos += 1;
+                                    }
                                 }
                             }
                         }
@@ -85,7 +115,9 @@ pub fn dbg_parse() {
                 }
                 eprintln!("   after skip '{o}': pos={}", r.pos);
             }
-            _ => { r.pos += 1; }
+            _ => {
+                r.pos += 1;
+            }
         }
     }
     eprintln!("stopped at pos={} tok={:?}", r.pos, r.peek());

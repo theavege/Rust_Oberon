@@ -108,11 +108,7 @@ impl Segment {
         for (ti, t) in self.terrains.iter().enumerate() {
             self.hashtable.insert(t.layer, ti);
         }
-        self.max_layer = self
-            .terrains
-            .last()
-            .map(|t| t.layer)
-            .unwrap_or(0);
+        self.max_layer = self.terrains.last().map(|t| t.layer).unwrap_or(0);
     }
 }
 
@@ -146,7 +142,11 @@ impl Scheme {
                         if is_str {
                             r.pos += 1;
                             let v = r.str().unwrap_or_default();
-                            if w.as_str() == "name" { sch.name = v; } else { sch.author = v; }
+                            if w.as_str() == "name" {
+                                sch.name = v;
+                            } else {
+                                sch.author = v;
+                            }
                         } else {
                             r.pos += 1;
                         }
@@ -242,8 +242,7 @@ impl Scheme {
                                                         }
                                                         "layer" => {
                                                             r.pos += 1;
-                                                            tp.layer =
-                                                                r.int().unwrap_or(0) as u8;
+                                                            tp.layer = r.int().unwrap_or(0) as u8;
                                                         }
                                                         "difficulty" => {
                                                             r.pos += 1;
@@ -555,7 +554,7 @@ mod tests {
         assert_eq!(seg.get_terrain_type(9), 4); // 9 -> up to 10 -> idx 4
         assert_eq!(seg.get_terrain_type(11), 5); // 11 -> up to 30 -> idx 5
         assert_eq!(seg.get_terrain_type(1), 1); // 1 -> up to 5 -> idx 1
-        // out-of-range clamps:
+                                                // out-of-range clamps:
         assert_eq!(seg.get_terrain_type(256), 6); // > max_layer 255 -> max entry
         assert_eq!(seg.get_terrain_type(-1), 0); // negative -> 0
     }

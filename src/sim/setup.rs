@@ -48,9 +48,6 @@ pub fn spawn_initial_units(
             .and_then(|grid| grid.nearest_walkable(requested))
             .map(NavigationGrid::cell_center)
             .unwrap_or_else(|| GameState::iso_pos(x, y) + Vec2::new(0.0, -CELL_H / 2.0));
-        commands.spawn((
-            ResourceNode { wood: 30 },
-            WorldPosition(pos),
-        ));
+        commands.spawn((ResourceNode { wood: 30 }, WorldPosition(pos)));
     }
 }

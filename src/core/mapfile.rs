@@ -132,7 +132,10 @@ fn collect_start_points(r: &mut Reader, out: &mut Vec<StartPoint>) {
             Tok::Word(w) if w.starts_with("start_point_") => {
                 r.pos += 1;
                 if let (Some(x), Some(y)) = (r.int(), r.int()) {
-                    out.push(StartPoint { x: x as u32, y: y as u32 });
+                    out.push(StartPoint {
+                        x: x as u32,
+                        y: y as u32,
+                    });
                 }
                 continue;
             }
@@ -142,7 +145,12 @@ fn collect_start_points(r: &mut Reader, out: &mut Vec<StartPoint>) {
     }
 }
 
-fn load_segment(r: &mut Reader, map: &mut MapFile, scheme: &Scheme, sid: usize) -> Result<(), String> {
+fn load_segment(
+    r: &mut Reader,
+    map: &mut MapFile,
+    scheme: &Scheme,
+    sid: usize,
+) -> Result<(), String> {
     // ensure surface exists for this segment id (segments are dense 0..2 in DO)
     while map.surfaces.len() <= sid {
         map.surfaces
@@ -183,7 +191,11 @@ fn load_segment(r: &mut Reader, map: &mut MapFile, scheme: &Scheme, sid: usize) 
 
     // Fill empty cells with the implicit default fragment (index = last in
     // scheme segment list), scanning column-major like C (`for i in width`).
-    let default_fid = scheme.segments.get(sid).map(|s| s.fragments.len() - 1).unwrap_or(0);
+    let default_fid = scheme
+        .segments
+        .get(sid)
+        .map(|s| s.fragments.len() - 1)
+        .unwrap_or(0);
     let mut k = 0u32;
     let mut l = 0u32;
     loop {
@@ -215,7 +227,11 @@ fn load_segment(r: &mut Reader, map: &mut MapFile, scheme: &Scheme, sid: usize) 
             y: cy,
             segment: sid,
         });
-        if let Some(frag) = scheme.segments.get(sid).and_then(|s| s.fragments.get(default_fid)) {
+        if let Some(frag) = scheme
+            .segments
+            .get(sid)
+            .and_then(|s| s.fragments.get(default_fid))
+        {
             for i in 0..frag.width {
                 for j in 0..frag.height {
                     let gx = cx + i as u32;

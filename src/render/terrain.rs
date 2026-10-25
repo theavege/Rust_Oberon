@@ -19,9 +19,9 @@ use std::collections::HashMap;
 
 use bevy::asset::LoadState;
 use bevy::image::{Image, TextureAtlasLayout};
+use bevy::log::warn;
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
-use bevy::log::warn;
 
 use crate::core::gamestate::GameState;
 
@@ -78,7 +78,8 @@ fn load_group_atlases(
                 continue;
             }
             let entry = atlases.0.entry(tex.file.clone()).or_insert_with(|| {
-                let handle: Handle<Image> = asset_servers.load(asset_path(&gs.asset_dir, &tex.file));
+                let handle: Handle<Image> =
+                    asset_servers.load(asset_path(&gs.asset_dir, &tex.file));
                 (handle, Handle::<TextureAtlasLayout>::default())
             });
             // Build the atlas layout once the image has finished decoding.

@@ -11,17 +11,19 @@ pub fn spawn_camera(mut commands: Commands, game: Option<Res<GameState>>) {
         .as_ref()
         .map(|gs| GameState::iso_pos(gs.map.width / 2, gs.map.height / 2))
         .unwrap_or(Vec2::new(0.0, -640.0));
-    let camera = commands.spawn((
-        Camera2d,
-        // Show a useful portion of the imported map at its native pixel scale.
-        Projection::from(OrthographicProjection {
-            scaling_mode: ScalingMode::FixedVertical {
-                viewport_height: 900.0,
-            },
-            ..OrthographicProjection::default_2d()
-        }),
-        Transform::from_xyz(center.x, center.y, 1000.0),
-    )).id();
+    let camera = commands
+        .spawn((
+            Camera2d,
+            // Show a useful portion of the imported map at its native pixel scale.
+            Projection::from(OrthographicProjection {
+                scaling_mode: ScalingMode::FixedVertical {
+                    viewport_height: 900.0,
+                },
+                ..OrthographicProjection::default_2d()
+            }),
+            Transform::from_xyz(center.x, center.y, 1000.0),
+        ))
+        .id();
     commands.entity(camera).with_children(|parent| {
         parent.spawn((
             Text2d::new("Wood: 0"),
