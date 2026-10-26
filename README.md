@@ -37,6 +37,21 @@ Build a small, testable combat slice before adding an enemy opponent:
 
 Done when a player unit can attack an enemy, the enemy takes damage and is removed at zero health, and simulation tests cover those rules. Then add a basic opponent that can attack back.
 
+### Tooling: lint and format
+
+Install Rust, Cargo, Clippy and rustfmt with rustup:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --component clippy --component rustfmt
+```
+
+Before committing, check formatting and lints from the repository root:
+
+```sh
+cargo fmt --check   # verify formatting (use `cargo fmt` to apply)
+cargo clippy --all-targets
+```
+
 ### First milestone acceptance checklist
 
 - [x] Original map and terrain are visible at a useful scale.
