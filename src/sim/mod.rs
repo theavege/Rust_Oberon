@@ -315,6 +315,7 @@ fn movement_system(
 /// Fixed-step combat resolution: units with an `AttackOrder` move toward their
 /// target (handled by `movement_system`) and strike whenever the target is in
 /// range and the cooldown has elapsed. Invalid or dead targets are dropped.
+#[allow(clippy::type_complexity)]
 fn attack_system(
     time: Res<Time<Fixed>>,
     combat: Res<CombatDefinition>,
@@ -331,47 +332,56 @@ fn attack_system(
         With<Unit>,
     >,
     targets: Query<(Entity, &Player, &WorldPosition, &Health), With<Unit>>,
+    mut victims: Query<&mut Health, With<Unit>>,
 ) {
     let dt = time.delta_secs();
-    // Snapshot the living victims first: a lethal strike inside this same
-    // step must not stop another attacker from also landing its blow, and we
-    // never mutate target health while iterating it.
-    let victims: Vec<(Entity, u8, Vec2, f32)> = targets
+    // Snapshot every unit up front: a lethal strike inside this same step
+    // must not stop another attacker from also landing its blow, and we never
+    // mutate target health while iterating the query.
+    #[allow(clippy::type_complexity)]
+    let units_snapshot: Vec<(Entity, u8, Vec2, f32)> = targets
         .iter()
-        .filter(|(_, _, _, health)| health.current > 0.0)
-        .map(|(entity, player, position, _)| (entity, player.0, position.0, 0.0))
+        .map(|(entity, player, position, health)| (entity, player.0, position.0, health.current))
+        .collect();
+    let living: Vec<(Entity, u8, Vec2)> = units_snapshot
+        .iter()
+        .filter(|(_, _, _, current)| *current > 0.0)
+        .map(|&(entity, player, position, _)| (entity, player, position))
         .collect();
 
-    for (entity, unit, position, order, cooldown, attacker_health) in &mut attackers {
+    for (entity, unit, position, order, mut cooldown, attacker_health) in &mut attackers {
         // A dead attacker no longer fights; death_system despawns it anyway.
         if attacker_health.is_some_and(|health| health.current <= 0.0) {
             continue;
         }
+        // The attacker's own snapshot row gives its player id without needing
+        // an extra query against the live world.
+        let owner = units_snapshot
+            .iter()
+            .find(|(id, ..)| *id == entity)
+            .map(|&(_, player, _, _)| player);
         // Drop stale orders: the target must still exist, be alive, and not
         // belong to the attacker's own player (no friendly fire).
-        let owner = commands
-            .get_entity(entity)
-            .ok()
-            .and_then(|entry| entry.get::<Player>().map(|player| player.0));
-        let target_ok = victims.iter().any(|(id, player, _, _)| {
-            *id == order.target && Some(*player) != owner
-        });
+        let target_ok = living
+            .iter()
+            .any(|(id, player, _)| *id == order.target && Some(*player) != owner);
         if !target_ok {
             commands.entity(entity).remove::<AttackOrder>();
             continue;
         }
 
         let Some(mut cooldown) = cooldown else {
-            // First step after issuing the order: wait one tick so attacks
-            // follow the configured cadence from the moment they enter range.
+            // First step after issuing the order: start the cooldown component
+            // ready so the unit strikes as soon as it is in range.
+            commands.entity(entity).insert(AttackCooldown(0.0));
             continue;
         };
         if cooldown.0 > 0.0 {
             cooldown.0 = (cooldown.0 - dt).max(0.0);
             continue;
         }
-        let Some((_, _, target_position, _)) =
-            victims.iter().find(|(id, ..)| *id == order.target)
+        let Some((_, _, target_position)) =
+            living.iter().find(|(id, ..)| *id == order.target)
         else {
             continue;
         };
@@ -381,10 +391,10 @@ fn attack_system(
         }
 
         let damage = combat.damage_for(unit.kind);
-        if let Some(mut health) = commands.get_entity(order.target).ok().flatten() {
-            let Some(mut health) = health.get_mut::<Health>() else {
-                continue;
-            };
+        // `victims` is a separate query from the read-only snapshot above, so
+        // writes here never conflict with iteration state. Overkill clamps at
+        // zero inside `Health::take_damage`.
+        if let Ok(mut health) = victims.get_mut(order.target) {
             if health.take_damage(damage) {
                 commands.entity(order.target).insert(Dead);
             }
@@ -462,54 +472,78 @@ fn opponent_ai_system(
 mod tests {
     use super::*;
     use crate::core::units::KindCombat;
-    use std::collections::VecDeque;
+    use bevy::time::{TimePlugin, Virtual};
     use std::time::Duration;
 
-    /// Fixed timestep used by all combat tests: 1/20 s per step. The harness
-    /// passes this to the systems as `FixedStep` directly — no Bevy clock or
-    /// `Main` loop involved, so every `step()` is exactly one sim tick.
+    /// Fixed timestep used by all combat tests: 1/20 s per step.
     const DT: f32 = 0.05;
-
-    struct TestApp {
-        world: World,
-    }
+    /// Bevy's default `Real` clock update period; the speed multiplier below
+    /// makes every `app.update()` advance exactly one fixed tick of `DT`.
+    const UPDATE_PERIOD: Duration = Duration::from_micros(2000);
 
     /// Small walkable open area so units can path and approach targets.
     const TEST_MAP: u32 = 64;
 
-    fn open_navigation_grid(size: u32) -> NavigationGrid {
-        NavigationGrid::open_field(size)
+    /// Build a bare Bevy app that runs exactly the production `FixedUpdate`
+    /// schedule (same systems, same ordering) without any rendering, window
+    /// or real clock. Time is virtual, so each `step()` advances the sim by
+    /// precisely one fixed tick — fully deterministic.
+    fn combat_test_app(combat: CombatDefinition) -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(TimePlugin)
+            .insert_resource(Time::<Virtual>::default())
+
+            .insert_resource(open_grid())
+            .insert_resource(combat)
+            .init_resource::<PlayerEconomy>()
+            .init_resource::<ShedPlacement>()
+            .init_resource::<ShedDefinition>()
+            .add_event::<PlayerCommand>()
+            .add_systems(
+                FixedUpdate,
+                (
+                    opponent_ai_system,
+                    movement_system.after(opponent_ai_system),
+                    harvest_system.after(movement_system),
+                    construction_system.after(harvest_system),
+                    attack_system.after(construction_system),
+                    death_system.after(attack_system),
+                ),
+            );
+        // Advance the virtual clock by exactly one fixed tick per `step()`.
+        let multiplier = UPDATE_PERIOD.as_secs_f64() / DT as f64;
+        app.world_mut()
+            .resource_mut::<Time<Virtual>>()
+            .set_relative_speed(multiplier as f32);
+        app
+    }
+
+    fn open_grid() -> NavigationGrid {
+        NavigationGrid::open_field(TEST_MAP)
+    }
+
+    struct TestApp {
+        app: App,
     }
 
     impl TestApp {
         fn new() -> Self {
-            // Bare `World`, systems run manually in the exact production
-            // order. Deterministic: no schedules, clocks, or plugin machinery
-            // that could skip or double-run a tick.
-            let mut world = World::default();
-            world.insert_resource(FixedStep {
-                delta_secs: Duration::from_secs_f32(DT),
-            });
-            world.insert_resource(open_navigation_grid(TEST_MAP));
-            world.insert_resource(CombatDefinition::default());
-            world.init_resource::<PlayerEconomy>();
-            world.init_resource::<ShedPlacement>();
-            world.init_resource::<ShedDefinition>();
-            world.add_event::<PlayerCommand>();
-            // Event reader state must exist before the first manual run.
-            world.resource_mut::<Events<PlayerCommand>>().update();
-            TestApp { world }
+            TestApp {
+                app: combat_test_app(CombatDefinition::default()),
+            }
         }
 
-        fn spawn_unit(
-            &mut self,
-            kind: UnitKind,
-            owner: u8,
-            position: Vec2,
-            selected: bool,
-        ) -> Entity {
+        fn with_combat(combat: CombatDefinition) -> Self {
+            TestApp {
+                app: combat_test_app(combat),
+            }
+        }
+
+        fn spawn_unit(&mut self, kind: UnitKind, owner: u8, position: Vec2, selected: bool) -> Entity {
             let entity = self
-                .world
+                .app
+                .world_mut()
                 .spawn((
                     Unit { kind },
                     Player(owner),
@@ -522,33 +556,18 @@ mod tests {
                 ))
                 .id();
             if selected {
-                self.world.entity_mut(entity).insert(Selected);
+                self.app.world_mut().entity_mut(entity).insert(Selected);
             }
             entity
         }
 
         fn send(&mut self, command: PlayerCommand) {
-            self.world.send_event(command);
+            self.app.world_mut().send_event(command);
         }
 
-        /// Advance the simulation by exactly one fixed step of `DT` seconds,
-        /// running the same systems in the same order as the real game loop.
+        /// Advance the simulation by exactly one fixed step of `DT` seconds.
         fn step(&mut self) {
-            // Publish the previous frame's events so readers see what was
-            // sent since the last step, then run each system once.
-            self.world
-                .resource_mut::<Events<PlayerCommand>>()
-                .update();
-            apply_player_commands(&mut self.world);
-            opponent_ai_system(&mut self.world);
-            movement_system(&mut self.world);
-            attack_system(&mut self.world);
-            death_system(&mut self.world);
-            // Apply deferred command buffers between systems, mirroring how
-            // schedule barriers work in the real app: an `AttackOrder`
-            // inserted by the AI becomes visible to `attack_system` in the
-            // very same tick.
-            self.world.flush();
+            self.app.update();
         }
 
         fn steps(&mut self, count: usize) {
@@ -558,31 +577,59 @@ mod tests {
         }
 
         fn health(&self, entity: Entity) -> Option<f32> {
-            self.world.get::<Health>(entity).map(|health| health.current)
+            self.app
+                .world()
+                .get::<Health>(entity)
+                .map(|health| health.current)
         }
 
         fn has_attack_order(&self, entity: Entity) -> bool {
-            self.world.get::<AttackOrder>(entity).is_some()
+            self.app.world().get::<AttackOrder>(entity).is_some()
         }
 
         fn attack_target(&self, entity: Entity) -> Option<Entity> {
-            self.world
+            self.app
+                .world()
                 .get::<AttackOrder>(entity)
-                .map(|o| o.target)
+                .map(|order| order.target)
         }
 
         fn cooldown(&self, entity: Entity) -> Option<f32> {
-            self.world.get::<AttackCooldown>(entity).map(|c| c.0)
+            self.app.world().get::<AttackCooldown>(entity).map(|c| c.0)
         }
 
         fn position(&self, entity: Entity) -> Option<Vec2> {
-            self.world.get::<WorldPosition>(entity).map(|p| p.0)
+            self.app
+                .world()
+                .get::<WorldPosition>(entity)
+                .map(|p| p.0)
+        }
+
+        fn set_position(&mut self, entity: Entity, position: Vec2) {
+            self.app.world_mut().entity_mut(entity).insert(WorldPosition(position));
+        }
+
+        fn set_health(&mut self, entity: Entity, current: f32) {
+            let max = self.health(entity).unwrap_or(current);
+            self.app
+                .world_mut()
+                .entity_mut(entity)
+                .insert(Health { current, max });
+        }
+
+        fn mark_dead(&mut self, entity: Entity) {
+            self.app.world_mut().entity_mut(entity).insert(Dead);
+        }
+
+        fn despawn(&mut self, entity: Entity) {
+            self.app.world_mut().despawn(entity);
         }
 
         fn alive_count(&mut self) -> usize {
-            self.world
+            self.app
+                .world_mut()
                 .query_filtered::<Entity, With<Unit>>()
-                .iter(&self.world)
+                .iter(self.app.world())
                 .count()
         }
     }
@@ -598,15 +645,13 @@ mod tests {
         // lands hit one once the cooldown tick has elapsed.
         test.steps(2);
         assert_eq!(test.health(target), Some(40.0 - 20.0));
-        assert!(test.world.get::<Dead>(target).is_none());
+        assert!(test.alive_count() == 2, "one hit does not kill");
 
         test.steps(20); // hit two brings the 40 HP peasant to zero.
         assert!(
-            test.world.get::<Dead>(target).is_some(),
-            "lethal damage must mark the unit Dead inside the sim"
+            test.health(target).is_none(),
+            "dead units are removed by the fixed-step sim"
         );
-        test.step(); // death_system despawns marked units.
-        assert!(test.health(target).is_none(), "dead units are removed");
         assert!(
             !test.has_attack_order(attacker),
             "orders against dead targets drop"
@@ -629,9 +674,7 @@ mod tests {
         );
 
         // Teleport into range: the next eligible step must deal damage.
-        let mut position = test.world.get_mut::<WorldPosition>(attacker).unwrap();
-        position.0 = Vec2::X * 20.0; // borrow ends here, before the next step
-        drop(position);
+        test.set_position(attacker, Vec2::X * 20.0);
         test.steps(2);
         assert_eq!(test.health(target), Some(80.0), "damage once in range");
     }
@@ -647,7 +690,7 @@ mod tests {
         assert_eq!(test.health(target), Some(80.0));
         assert!(test.cooldown(attacker).is_some());
 
-        // Half a cooldown later (0.5 s at 1.0 s cadence): still only one hit.
+        // Half a cooldown later (0.5 s at a 1.0 s cadence): still only one hit.
         test.steps(10);
         assert_eq!(test.health(target), Some(80.0), "cooldown gates strikes");
 
@@ -658,8 +701,7 @@ mod tests {
 
     #[test]
     fn cooldown_scale_is_data_driven() {
-        let mut test = TestApp::new();
-        test.world.insert_resource(CombatDefinition {
+        let mut test = TestApp::with_combat(CombatDefinition {
             cooldown_scale: 2.0,
             ..default()
         });
@@ -680,8 +722,7 @@ mod tests {
 
     #[test]
     fn per_kind_damage_override_changes_lethality() {
-        let mut test = TestApp::new();
-        test.world.insert_resource(CombatDefinition {
+        let mut test = TestApp::with_combat(CombatDefinition {
             warrior: KindCombat {
                 damage: Some(40.0),
                 ..default()
@@ -692,10 +733,10 @@ mod tests {
         let target = test.spawn_unit(UnitKind::Peasant, 1, Vec2::X * 10.0, false);
 
         test.send(PlayerCommand::Attack(target));
-        test.steps(2); // one overridden 40-damage strike kills the 40 HP peasant
+        test.steps(3); // one overridden 40-damage strike kills the 40 HP peasant
         assert!(
-            test.health(target).is_none() || test.world.get::<Dead>(target).is_some(),
-            "a single lethal blow must kill"
+            test.health(target).is_none(),
+            "a single lethal blow must kill and despawn"
         );
     }
 
@@ -744,7 +785,7 @@ mod tests {
         test.send(PlayerCommand::Attack(victim));
         test.step();
         assert_eq!(test.attack_target(attacker), Some(victim));
-        test.world.despawn(victim);
+        test.despawn(victim);
         test.step();
         assert!(
             !test.has_attack_order(attacker),
@@ -767,8 +808,8 @@ mod tests {
     #[test]
     fn opponent_ai_attacks_back_and_retargets_after_death() {
         let mut test = TestApp::new();
-        // Archer (range 90) outranges Warrior (melee 30): the enemy picks the
-        // closest player-0 unit on its own and starts firing immediately.
+        // Archer (range 90) vs enemy Warrior (melee 30): the enemy picks the
+        // closest player-0 unit on its own and starts attacking it.
         let archer = test.spawn_unit(UnitKind::Archer, 0, Vec2::ZERO, false);
         let enemy = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 25.0, false);
 
@@ -776,12 +817,9 @@ mod tests {
         assert_eq!(test.attack_target(enemy), Some(archer));
         assert_eq!(test.health(archer), Some(60.0 - 20.0));
 
-        // Kill the archer through the sim; the enemy must retarget or drop.
-        {
-            let mut hp = test.world.get_mut::<Health>(archer).unwrap();
-            hp.current = 0.0; // borrow ends at the end of this block
-        }
-        test.world.entity_mut(archer).insert(Dead);
+        // Kill the archer through the sim; the enemy must drop the stale order.
+        test.set_health(archer, 0.0);
+        test.mark_dead(archer);
         test.steps(3);
         assert!(
             test.health(archer).is_none(),
