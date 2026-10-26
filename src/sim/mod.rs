@@ -324,26 +324,39 @@ fn attack_system(
             Entity,
             &Unit,
             &WorldPosition,
-            &mut AttackOrder,
+            &AttackOrder,
             Option<&mut AttackCooldown>,
             Option<&Health>,
         ),
-        With<Player>,
+        With<Unit>,
     >,
-    mut targets: Query<(&WorldPosition, &mut Health), (With<Unit>, Without<Player>)>,
+    targets: Query<(Entity, &Player, &WorldPosition, &Health), With<Unit>>,
 ) {
     let dt = time.delta_secs();
+    // Snapshot the living victims first: a lethal strike inside this same
+    // step must not stop another attacker from also landing its blow, and we
+    // never mutate target health while iterating it.
+    let victims: Vec<(Entity, u8, Vec2, f32)> = targets
+        .iter()
+        .filter(|(_, _, _, health)| health.current > 0.0)
+        .map(|(entity, player, position, _)| (entity, player.0, position.0, 0.0))
+        .collect();
+
     for (entity, unit, position, order, cooldown, attacker_health) in &mut attackers {
         // A dead attacker no longer fights; death_system despawns it anyway.
         if attacker_health.is_some_and(|health| health.current <= 0.0) {
             continue;
         }
-        // Drop stale orders: the target must still exist and be alive.
-        let target_alive = match targets.get(order.target) {
-            Ok((_, health)) => health.current > 0.0,
-            Err(_) => false,
-        };
-        if !target_alive {
+        // Drop stale orders: the target must still exist, be alive, and not
+        // belong to the attacker's own player (no friendly fire).
+        let owner = commands
+            .get_entity(entity)
+            .ok()
+            .and_then(|entry| entry.get::<Player>().map(|player| player.0));
+        let target_ok = victims.iter().any(|(id, player, _, _)| {
+            *id == order.target && Some(*player) != owner
+        });
+        if !target_ok {
             commands.entity(entity).remove::<AttackOrder>();
             continue;
         }
@@ -357,16 +370,21 @@ fn attack_system(
             cooldown.0 = (cooldown.0 - dt).max(0.0);
             continue;
         }
-        let distance = match targets.get(order.target) {
-            Ok((target_position, _)) => position.0.distance(target_position.0),
-            Err(_) => continue,
+        let Some((_, _, target_position, _)) =
+            victims.iter().find(|(id, ..)| *id == order.target)
+        else {
+            continue;
         };
+        let distance = position.0.distance(*target_position);
         if distance > combat.range_for(unit.kind) {
             continue;
         }
 
         let damage = combat.damage_for(unit.kind);
-        if let Ok((_, mut health)) = targets.get_mut(order.target) {
+        if let Some(mut health) = commands.get_entity(order.target).ok().flatten() {
+            let Some(mut health) = health.get_mut::<Health>() else {
+                continue;
+            };
             if health.take_damage(damage) {
                 commands.entity(order.target).insert(Dead);
             }
@@ -444,23 +462,16 @@ fn opponent_ai_system(
 mod tests {
     use super::*;
     use crate::core::units::KindCombat;
-    use bevy::app::FixedMain;
-    use bevy::time::{Fixed, TimeUpdateStrategy};
+    use std::collections::VecDeque;
     use std::time::Duration;
 
-    /// Fixed timestep used by all combat tests: 1/20 s per step.
+    /// Fixed timestep used by all combat tests: 1/20 s per step. The harness
+    /// passes this to the systems as `FixedStep` directly — no Bevy clock or
+    /// `Main` loop involved, so every `step()` is exactly one sim tick.
     const DT: f32 = 0.05;
 
-    /// Schedule label used by the test harness to run one deterministic sim
-    /// tick. Registered explicitly in `TestApp::new` (a bare `App` has no
-    /// schedules, and this keeps Bevy's automatic time-stepping out of it).
-    #[derive(
-        Clone, Copy, Debug, Eq, PartialEq, Hash, bevy::ecs::schedule::ScheduleLabel, Default,
-    )]
-    struct SimStep;
-
     struct TestApp {
-        app: App,
+        world: World,
     }
 
     /// Small walkable open area so units can path and approach targets.
@@ -472,46 +483,22 @@ mod tests {
 
     impl TestApp {
         fn new() -> Self {
-            // Register our sim systems under the dedicated `SimStep` schedule
-            // and drive it manually in `step()` — no Bevy time machinery.
-            let mut app = App::new();
-            // `TimePlugin` provides the `Time`/`Time<Fixed>` resources and
-            // registers the standard schedules; we never run `Main`, so only
-            // our manually driven `SimStep` schedule below executes.
-            // `MainSchedulePlugin` provides the frame machinery (`First`,
-            // `RunFixedMainLoop`, event cleanup); `TimePlugin` steps the
-            // clocks and drives `FixedMain`. With a manual update strategy,
-            // every `app.update()` advances virtual time by exactly one `DT`
-            // frame, so each test `step()` is one deterministic sim tick —
-            // the same path the real game loop takes, with deferred commands
-            // applied by Bevy's own schedule machinery.
-            app.add_plugins((
-                bevy::app::MainSchedulePlugin,
-                bevy::time::TimePlugin,
-            ))
-                .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
-                    DT,
-                )))
-                .add_schedule(Schedule::new(SimStep))
-                .add_systems(FixedMain, run_sim_step)
-                .add_systems(
-                    SimStep,
-                    (
-                        apply_player_commands,
-                        opponent_ai_system.after(apply_player_commands),
-                        movement_system.after(opponent_ai_system),
-                        attack_system.after(movement_system),
-                        death_system.after(attack_system),
-                    ),
-                )
-                .insert_resource(Time::<Fixed>::from_duration(Duration::from_secs_f32(DT)))
-                .insert_resource(open_navigation_grid(TEST_MAP))
-                .insert_resource(CombatDefinition::default())
-                .init_resource::<PlayerEconomy>()
-                .init_resource::<ShedPlacement>()
-                .init_resource::<ShedDefinition>()
-                .add_event::<PlayerCommand>();
-            TestApp { app }
+            // Bare `World`, systems run manually in the exact production
+            // order. Deterministic: no schedules, clocks, or plugin machinery
+            // that could skip or double-run a tick.
+            let mut world = World::default();
+            world.insert_resource(FixedStep {
+                delta_secs: Duration::from_secs_f32(DT),
+            });
+            world.insert_resource(open_navigation_grid(TEST_MAP));
+            world.insert_resource(CombatDefinition::default());
+            world.init_resource::<PlayerEconomy>();
+            world.init_resource::<ShedPlacement>();
+            world.init_resource::<ShedDefinition>();
+            world.add_event::<PlayerCommand>();
+            // Event reader state must exist before the first manual run.
+            world.resource_mut::<Events<PlayerCommand>>().update();
+            TestApp { world }
         }
 
         fn spawn_unit(
@@ -522,8 +509,7 @@ mod tests {
             selected: bool,
         ) -> Entity {
             let entity = self
-                .app
-                .world_mut()
+                .world
                 .spawn((
                     Unit { kind },
                     Player(owner),
@@ -536,22 +522,33 @@ mod tests {
                 ))
                 .id();
             if selected {
-                self.app.world_mut().entity_mut(entity).insert(Selected);
+                self.world.entity_mut(entity).insert(Selected);
             }
             entity
         }
 
         fn send(&mut self, command: PlayerCommand) {
-            self.app.world_mut().send_event(command);
+            self.world.send_event(command);
         }
 
-        /// Advance the simulation by exactly one fixed step of `DT` seconds.
+        /// Advance the simulation by exactly one fixed step of `DT` seconds,
+        /// running the same systems in the same order as the real game loop.
         fn step(&mut self) {
-            // Deterministic manual tick: advance the clock by exactly one
-            // fixed timestep (so systems reading `Time<Fixed>::delta_secs()`
-            // see `DT`), then run the sim schedule once. No accumulators or
-            // wall-clock time involved.
-            self.app.update();
+            // Publish the previous frame's events so readers see what was
+            // sent since the last step, then run each system once.
+            self.world
+                .resource_mut::<Events<PlayerCommand>>()
+                .update();
+            apply_player_commands(&mut self.world);
+            opponent_ai_system(&mut self.world);
+            movement_system(&mut self.world);
+            attack_system(&mut self.world);
+            death_system(&mut self.world);
+            // Apply deferred command buffers between systems, mirroring how
+            // schedule barriers work in the real app: an `AttackOrder`
+            // inserted by the AI becomes visible to `attack_system` in the
+            // very same tick.
+            self.world.flush();
         }
 
         fn steps(&mut self, count: usize) {
@@ -561,45 +558,33 @@ mod tests {
         }
 
         fn health(&self, entity: Entity) -> Option<f32> {
-            self.app
-                .world()
-                .get::<Health>(entity)
-                .map(|health| health.current)
+            self.world.get::<Health>(entity).map(|health| health.current)
         }
 
         fn has_attack_order(&self, entity: Entity) -> bool {
-            self.app.world().get::<AttackOrder>(entity).is_some()
+            self.world.get::<AttackOrder>(entity).is_some()
         }
 
         fn attack_target(&self, entity: Entity) -> Option<Entity> {
-            self.app
-                .world()
+            self.world
                 .get::<AttackOrder>(entity)
                 .map(|o| o.target)
         }
 
         fn cooldown(&self, entity: Entity) -> Option<f32> {
-            self.app.world().get::<AttackCooldown>(entity).map(|c| c.0)
+            self.world.get::<AttackCooldown>(entity).map(|c| c.0)
         }
 
         fn position(&self, entity: Entity) -> Option<Vec2> {
-            self.app.world().get::<WorldPosition>(entity).map(|p| p.0)
+            self.world.get::<WorldPosition>(entity).map(|p| p.0)
         }
 
         fn alive_count(&mut self) -> usize {
-            let world = self.app.world_mut();
-            world
+            self.world
                 .query_filtered::<Entity, With<Unit>>()
-                .iter(world)
+                .iter(&self.world)
                 .count()
         }
-    }
-
-
-    /// Bridge system: runs the ordered sim schedule from inside `FixedMain`,
-    /// once per accumulated fixed step.
-    fn run_sim_step(world: &mut World) {
-        world.run_schedule(SimStep);
     }
 
     #[test]
@@ -609,14 +594,15 @@ mod tests {
         let target = test.spawn_unit(UnitKind::Peasant, 1, Vec2::X * 10.0, false);
 
         test.send(PlayerCommand::Attack(target));
-        // Step 1 installs the cooldown without striking; step 2 lands hit one.
+        // Step 1 applies the order and walks the attacker into range; step 2
+        // lands hit one once the cooldown tick has elapsed.
         test.steps(2);
         assert_eq!(test.health(target), Some(40.0 - 20.0));
-        assert!(test.app.world().get::<Dead>(target).is_none());
+        assert!(test.world.get::<Dead>(target).is_none());
 
         test.steps(20); // hit two brings the 40 HP peasant to zero.
         assert!(
-            test.app.world().get::<Dead>(target).is_some(),
+            test.world.get::<Dead>(target).is_some(),
             "lethal damage must mark the unit Dead inside the sim"
         );
         test.step(); // death_system despawns marked units.
@@ -643,8 +629,9 @@ mod tests {
         );
 
         // Teleport into range: the next eligible step must deal damage.
-        let mut position = test.app.world_mut().get_mut::<WorldPosition>(attacker).unwrap();
+        let mut position = test.world.get_mut::<WorldPosition>(attacker).unwrap();
         position.0 = Vec2::X * 20.0; // borrow ends here, before the next step
+        drop(position);
         test.steps(2);
         assert_eq!(test.health(target), Some(80.0), "damage once in range");
     }
@@ -672,7 +659,7 @@ mod tests {
     #[test]
     fn cooldown_scale_is_data_driven() {
         let mut test = TestApp::new();
-        test.app.insert_resource(CombatDefinition {
+        test.world.insert_resource(CombatDefinition {
             cooldown_scale: 2.0,
             ..default()
         });
@@ -694,7 +681,7 @@ mod tests {
     #[test]
     fn per_kind_damage_override_changes_lethality() {
         let mut test = TestApp::new();
-        test.app.insert_resource(CombatDefinition {
+        test.world.insert_resource(CombatDefinition {
             warrior: KindCombat {
                 damage: Some(40.0),
                 ..default()
@@ -706,7 +693,10 @@ mod tests {
 
         test.send(PlayerCommand::Attack(target));
         test.steps(2); // one overridden 40-damage strike kills the 40 HP peasant
-        assert!(test.health(target).is_none() || test.app.world().get::<Dead>(target).is_some());
+        assert!(
+            test.health(target).is_none() || test.world.get::<Dead>(target).is_some(),
+            "a single lethal blow must kill"
+        );
     }
 
     #[test]
@@ -754,7 +744,7 @@ mod tests {
         test.send(PlayerCommand::Attack(victim));
         test.step();
         assert_eq!(test.attack_target(attacker), Some(victim));
-        test.app.world_mut().despawn(victim);
+        test.world.despawn(victim);
         test.step();
         assert!(
             !test.has_attack_order(attacker),
@@ -788,13 +778,10 @@ mod tests {
 
         // Kill the archer through the sim; the enemy must retarget or drop.
         {
-            let mut hp = test.app.world_mut().get_mut::<Health>(archer).unwrap();
+            let mut hp = test.world.get_mut::<Health>(archer).unwrap();
             hp.current = 0.0; // borrow ends at the end of this block
         }
-        test.app
-            .world_mut()
-            .entity_mut(archer)
-            .insert(crate::core::units::Dead);
+        test.world.entity_mut(archer).insert(Dead);
         test.steps(3);
         assert!(
             test.health(archer).is_none(),
