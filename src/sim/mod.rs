@@ -478,8 +478,22 @@ mod tests {
             // `TimePlugin` provides the `Time`/`Time<Fixed>` resources and
             // registers the standard schedules; we never run `Main`, so only
             // our manually driven `SimStep` schedule below executes.
-            app.add_plugins(bevy::time::TimePlugin)
+            // `MainSchedulePlugin` provides the frame machinery (`First`,
+            // `RunFixedMainLoop`, event cleanup); `TimePlugin` steps the
+            // clocks and drives `FixedMain`. With a manual update strategy,
+            // every `app.update()` advances virtual time by exactly one `DT`
+            // frame, so each test `step()` is one deterministic sim tick —
+            // the same path the real game loop takes, with deferred commands
+            // applied by Bevy's own schedule machinery.
+            app.add_plugins((
+                bevy::app::MainSchedulePlugin,
+                bevy::time::TimePlugin,
+            ))
+                .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
+                    DT,
+                )))
                 .add_schedule(Schedule::new(SimStep))
+                .add_systems(FixedMain, run_sim_step)
                 .add_systems(
                     SimStep,
                     (
@@ -537,25 +551,7 @@ mod tests {
             // fixed timestep (so systems reading `Time<Fixed>::delta_secs()`
             // see `DT`), then run the sim schedule once. No accumulators or
             // wall-clock time involved.
-            let world = self.app.world_mut();
-            let timestep = world.resource::<Time<Fixed>>().timestep();
-            world.resource_mut::<Time<Fixed>>().advance_by(timestep);
-            world.run_schedule(SimStep);
-            // `World::run_schedule` does not apply deferred commands on its
-            // own (the main app does that between schedule runs), so flush
-            // the command queues here: inserts/removals from this tick must
-            // be visible to the next tick and to test assertions.
-            let mut queues = world.resource_scope(|world, mut queues: RawCommandQueues| {
-                let result = CommandQueue::apply_or_prepare_panics_with_buckets(
-                    world.storages(),
-                    world.entities_metadatas(),
-                    &mut Default::default(),
-                    &mut queues,
-                    panic_outcome(),
-                );
-                (queues, result)
-            });
-            queues.0.apply(world).unwrap();
+            self.app.update();
         }
 
         fn steps(&mut self, count: usize) {
@@ -599,6 +595,12 @@ mod tests {
         }
     }
 
+
+    /// Bridge system: runs the ordered sim schedule from inside `FixedMain`,
+    /// once per accumulated fixed step.
+    fn run_sim_step(world: &mut World) {
+        world.run_schedule(SimStep);
+    }
 
     #[test]
     fn damage_kills_at_zero_health_and_despawns_the_unit() {
