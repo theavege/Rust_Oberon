@@ -444,11 +444,20 @@ fn opponent_ai_system(
 mod tests {
     use super::*;
     use crate::core::units::KindCombat;
+    use bevy::app::FixedMain;
     use bevy::time::{Fixed, TimeUpdateStrategy};
     use std::time::Duration;
 
     /// Fixed timestep used by all combat tests: 1/20 s per step.
     const DT: f32 = 0.05;
+
+    /// Schedule label used by the test harness to run one deterministic sim
+    /// tick. Registered explicitly in `TestApp::new` (a bare `App` has no
+    /// schedules, and this keeps Bevy's automatic time-stepping out of it).
+    #[derive(
+        Clone, Copy, Debug, Eq, PartialEq, Hash, bevy::ecs::schedule::ScheduleLabel, Default,
+    )]
+    struct SimStep;
 
     struct TestApp {
         app: App,
@@ -463,22 +472,16 @@ mod tests {
 
     impl TestApp {
         fn new() -> Self {
-            // A bare `App` has no time machinery at all, so we set up the
-            // pieces the simulation systems read: `Time<Fixed>` defines the
-            // step length (`Res<Time<Fixed>>` in every system), and an empty
-            // `FixedMain` schedule hosts the sim systems. `step()` below then
-            // runs exactly one fixed tick deterministically, without relying
-            // on accumulators or wall-clock time.
+            // Register our sim systems under the dedicated `SimStep` schedule
+            // and drive it manually in `step()` — no Bevy time machinery.
             let mut app = App::new();
-            app.insert_resource(Time::<Fixed>::from_duration(Duration::from_secs_f32(DT)))
-                .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
-                    DT,
-                )))
-                .edit_schedule(FixedMain, |schedule| {
-                    *schedule = Schedule::default();
-                })
+            // `TimePlugin` provides the `Time`/`Time<Fixed>` resources and
+            // registers the standard schedules; we never run `Main`, so only
+            // our manually driven `SimStep` schedule below executes.
+            app.add_plugins(bevy::time::TimePlugin)
+                .add_schedule(Schedule::new(SimStep))
                 .add_systems(
-                    FixedMain,
+                    SimStep,
                     (
                         apply_player_commands,
                         opponent_ai_system.after(apply_player_commands),
@@ -487,6 +490,7 @@ mod tests {
                         death_system.after(attack_system),
                     ),
                 )
+                .insert_resource(Time::<Fixed>::from_duration(Duration::from_secs_f32(DT)))
                 .insert_resource(open_navigation_grid(TEST_MAP))
                 .insert_resource(CombatDefinition::default())
                 .init_resource::<PlayerEconomy>()
@@ -529,16 +533,29 @@ mod tests {
 
         /// Advance the simulation by exactly one fixed step of `DT` seconds.
         fn step(&mut self) {
-            // Deterministic manual tick: set up the clock state that Bevy's
-            // fixed-step loop would build (`Time` mirrors `Time<Fixed>`), run
-            // the `FixedMain` schedule once, then apply the per-step delta so
-            // systems reading `Res<Time<Fixed>>::delta_secs()` see exactly
-            // `DT`. No accumulators or wall-clock time are involved.
+            // Deterministic manual tick: advance the clock by exactly one
+            // fixed timestep (so systems reading `Time<Fixed>::delta_secs()`
+            // see `DT`), then run the sim schedule once. No accumulators or
+            // wall-clock time involved.
             let world = self.app.world_mut();
             let timestep = world.resource::<Time<Fixed>>().timestep();
-            *world.resource_mut::<Time>() = world.resource::<Time<Fixed>>().as_generic();
             world.resource_mut::<Time<Fixed>>().advance_by(timestep);
-            world.run_schedule(FixedMain);
+            world.run_schedule(SimStep);
+            // `World::run_schedule` does not apply deferred commands on its
+            // own (the main app does that between schedule runs), so flush
+            // the command queues here: inserts/removals from this tick must
+            // be visible to the next tick and to test assertions.
+            let mut queues = world.resource_scope(|world, mut queues: RawCommandQueues| {
+                let result = CommandQueue::apply_or_prepare_panics_with_buckets(
+                    world.storages(),
+                    world.entities_metadatas(),
+                    &mut Default::default(),
+                    &mut queues,
+                    panic_outcome(),
+                );
+                (queues, result)
+            });
+            queues.0.apply(world).unwrap();
         }
 
         fn steps(&mut self, count: usize) {
