@@ -128,6 +128,15 @@ pub struct ShedDefinition {
     pub construction_seconds: f32,
 }
 
+/// Per-kind combat overrides. `None` keeps the `UnitKind` default; concrete
+/// values replace it, so content data can retune one unit type at a time.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KindCombat {
+    pub damage: Option<f32>,
+    pub range: Option<f32>,
+    pub cooldown: Option<f32>,
+}
+
 /// Data-driven combat tuning. The per-kind damage/range/cooldown defaults come
 /// from `UnitKind`; this resource lets those rules be overridden (and later,
 /// loaded from content data) without touching simulation code.
@@ -137,6 +146,10 @@ pub struct CombatDefinition {
     pub damage_scale: f32,
     /// Multiplier applied to every unit's attack cooldown.
     pub cooldown_scale: f32,
+    /// Per-unit-kind overrides applied after the global scales.
+    pub peasant: KindCombat,
+    pub warrior: KindCombat,
+    pub archer: KindCombat,
 }
 
 impl Default for CombatDefinition {
@@ -144,21 +157,45 @@ impl Default for CombatDefinition {
         Self {
             damage_scale: 1.0,
             cooldown_scale: 1.0,
+            peasant: KindCombat::default(),
+            warrior: KindCombat::default(),
+            archer: KindCombat::default(),
         }
     }
 }
 
 impl CombatDefinition {
+    fn overrides(&self, kind: UnitKind) -> KindCombat {
+        match kind {
+            UnitKind::Peasant => self.peasant,
+            UnitKind::Warrior => self.warrior,
+            UnitKind::Archer => self.archer,
+        }
+    }
+
     pub fn damage_for(&self, kind: UnitKind) -> f32 {
-        kind.damage() * self.damage_scale
+        self.overrides(kind)
+            .damage
+            .unwrap_or_else(|| kind.damage() * self.damage_scale)
     }
 
     pub fn range_for(&self, kind: UnitKind) -> f32 {
-        kind.attack_range()
+        self.overrides(kind)
+            .range
+            .unwrap_or_else(|| kind.attack_range())
     }
 
     pub fn cooldown_for(&self, kind: UnitKind) -> f32 {
-        kind.attack_cooldown() * self.cooldown_scale
+        self.overrides(kind)
+            .cooldown
+            .unwrap_or_else(|| kind.attack_cooldown() * self.cooldown_scale)
+    }
+
+    /// True when this kind can fight under the current definitions: positive
+    /// damage and a positive range, so a zero-damage or zero-range override
+    /// removes a unit from combat even if its kind normally attacks.
+    pub fn can_attack(&self, kind: UnitKind) -> bool {
+        self.damage_for(kind) > 0.0 && self.range_for(kind) > 0.0
     }
 }
 

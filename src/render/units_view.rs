@@ -5,8 +5,8 @@ use bevy::sprite::Anchor;
 
 use crate::core::map::NavigationGrid;
 use crate::core::units::{
-    Building, CombatDefinition, ConstructionSite, Dead, Health, Player, PlayerCommand,
-    PlayerEconomy, ResourceNode, Selected, ShedDefinition, ShedPlacement, Unit, WorldPosition,
+    Building, ConstructionSite, Dead, Health, Player, PlayerCommand, PlayerEconomy, ResourceNode,
+    Selected, ShedDefinition, ShedPlacement, Unit, UnitKind, WorldPosition,
 };
 
 /// Marker for unit visuals so we can find unsynced entities.
@@ -346,10 +346,22 @@ pub fn sync_unit_sprites(
 
 /// Distinguish enemy units by darkening their kind color slightly.
 fn enemy_tint(kind: UnitKind) -> Color {
-    let Color::srgb(r, g, b) = kind.color() else {
-        return kind.color();
-    };
-    Color::srgb(r * 0.75, g * 0.35, b * 0.35)
+    let mut tinted = kind.color();
+    if let Color::Srgba(rgba) = &mut tinted {
+        rgba.red *= 0.75;
+        rgba.green *= 0.35;
+        rgba.blue *= 0.35;
+    }
+    tinted
+}
+
+/// Extract the sRGB channels of a color, falling back to white for other
+/// color spaces (all game colors are defined as `Color::srgb`).
+fn srgb_channels(color: Color) -> (f32, f32, f32) {
+    match color.to_srgba() {
+        Srgba::NONE => (1.0, 1.0, 1.0),
+        srgba => (srgba.red, srgba.green, srgba.blue),
+    }
 }
 
 /// Remembers the sprite's non-damage tint so health shading composes correctly.
@@ -373,10 +385,7 @@ pub fn show_health(
         }
         let ratio = (health.current / health.max).clamp(0.0, 1.0);
         // Blend from the unit's base color toward red as health drops.
-        let Color::srgb(br, bg, bb) = base.0 else {
-            sprite.color = base.0;
-            continue;
-        };
+        let (br, bg, bb) = srgb_channels(base.0);
         let damage = 1.0 - ratio;
         sprite.color = Color::srgb(
             br * ratio + 0.85 * damage,
@@ -410,7 +419,7 @@ pub struct DeathFlash {
 
 pub fn spawn_death_flashes(
     mut commands: Commands,
-    removed: RemovedComponents<Unit>,
+    mut removed: RemovedComponents<Unit>,
     positions: Query<&WorldPosition>,
 ) {
     for entity in removed.read() {

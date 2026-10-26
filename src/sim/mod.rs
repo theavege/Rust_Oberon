@@ -24,7 +24,8 @@ impl Plugin for SimPlugin {
             .add_systems(
                 FixedUpdate,
                 (
-                    movement_system,
+                    opponent_ai_system,
+                    movement_system.after(opponent_ai_system),
                     harvest_system.after(movement_system),
                     construction_system.after(harvest_system),
                     attack_system.after(construction_system),
@@ -124,8 +125,7 @@ fn apply_player_commands(
             PlayerCommand::Attack(target) => {
                 // Validate the target: it must be a unit and not belong to the
                 // issuing player (no friendly fire, no attacking scenery).
-                let Ok((target_health, target_player, target_position)) =
-                    enemy_targets.get(target)
+                let Ok((target_health, target_player, target_position)) = enemy_targets.get(target)
                 else {
                     continue;
                 };
@@ -133,13 +133,12 @@ fn apply_player_commands(
                     continue;
                 }
                 for (entity, unit, selected, position) in &units {
-                    if selected.is_none() || !unit.kind.can_attack() {
+                    if selected.is_none() || !combat.can_attack(unit.kind) {
                         continue;
                     }
-                    commands.entity(entity).insert((
-                        AttackOrder { target },
-                        AttackCooldown::default(),
-                    ));
+                    commands
+                        .entity(entity)
+                        .insert((AttackOrder { target }, AttackCooldown::default()));
                     // Move into range if we are not already there. Approach one
                     // cell short of the target so units settle adjacent to it.
                     let distance = position.0.distance(target_position.0);
@@ -173,9 +172,7 @@ fn approach_path(navigation: &NavigationGrid, start: IVec2, goal: IVec2) -> Vec<
         .iter()
         .map(|&(dx, dy)| goal + IVec2::new(dx, dy))
         .filter(|&cell| navigation.is_walkable(cell))
-        .min_by_key(|&cell| {
-            (cell.x - start.x).unsigned_abs() + (cell.y - start.y).unsigned_abs()
-        });
+        .min_by_key(|&cell| (cell.x - start.x).unsigned_abs() + (cell.y - start.y).unsigned_abs());
     match best.or_else(|| navigation.nearest_walkable(goal)) {
         Some(cell) => navigation.find_path(start, cell).unwrap_or_default(),
         None => Vec::new(),
@@ -238,10 +235,7 @@ fn harvest_system(
     time: Res<Time<Fixed>>,
     mut economy: ResMut<PlayerEconomy>,
     mut commands: Commands,
-    mut workers: Query<
-        (Entity, &WorldPosition, &mut HarvestOrder),
-        (With<Unit>, With<Player>),
-    >,
+    mut workers: Query<(Entity, &WorldPosition, &mut HarvestOrder), (With<Unit>, With<Player>)>,
     mut nodes: Query<(&WorldPosition, &mut ResourceNode), Without<Unit>>,
 ) {
     for (worker, position, mut order) in &mut workers {
@@ -325,14 +319,17 @@ fn attack_system(
     time: Res<Time<Fixed>>,
     combat: Res<CombatDefinition>,
     mut commands: Commands,
-    mut attackers: Query<(
-        Entity,
-        &Unit,
-        &WorldPosition,
-        &mut AttackOrder,
-        Option<&mut AttackCooldown>,
-        Option<&Health>,
-    )>,
+    mut attackers: Query<
+        (
+            Entity,
+            &Unit,
+            &WorldPosition,
+            &mut AttackOrder,
+            Option<&mut AttackCooldown>,
+            Option<&Health>,
+        ),
+        With<Player>,
+    >,
     mut targets: Query<(&WorldPosition, &mut Health), With<Unit>>,
 ) {
     let dt = time.delta_secs();
@@ -383,5 +380,392 @@ fn attack_system(
 fn death_system(mut commands: Commands, dead: Query<Entity, With<Dead>>) {
     for entity in &dead {
         commands.entity(entity).despawn();
+    }
+}
+
+/// Basic opponent: enemy (player 1) units pick the closest living unit of
+/// another player as their target and move into range when needed. The regular
+/// `attack_system` then resolves these orders with the same cooldown and damage
+/// rules as player attacks, keeping the AI purely simulation-side. Player-0
+/// units are never auto-ordered; they only fight on explicit commands.
+fn opponent_ai_system(
+    combat: Res<CombatDefinition>,
+    navigation: Res<NavigationGrid>,
+    mut commands: Commands,
+    opponents: Query<
+        (Entity, &Unit, &WorldPosition, Option<&AttackOrder>),
+        (With<Player>, With<Health>),
+    >,
+    victims: Query<(Entity, &Player, &WorldPosition, &Health), With<Unit>>,
+    players: Query<&Player>,
+) {
+    for (entity, unit, position, order) in &opponents {
+        let Ok(owner) = players.get(entity) else {
+            continue;
+        };
+        if owner.0 != 1 || !combat.can_attack(unit.kind) {
+            continue;
+        }
+        // Already ordered against a living unit: nothing to reassign.
+        if order.is_some_and(|order| {
+            victims
+                .get(order.target)
+                .is_ok_and(|(_, _, _, health)| health.current > 0.0)
+        }) {
+            continue;
+        }
+        let Some((target, target_position)) = victims
+            .iter()
+            .filter(|(_, victim_player, _, health)| {
+                victim_player.0 != owner.0 && health.current > 0.0
+            })
+            .min_by(|a, b| {
+                a.2 .0
+                    .distance(position.0)
+                    .total_cmp(&b.2 .0.distance(position.0))
+            })
+            .map(|(target, _, target_position, _)| (target, *target_position))
+        else {
+            continue;
+        };
+        commands
+            .entity(entity)
+            .insert((AttackOrder { target }, AttackCooldown::default()));
+        if position.0.distance(target_position.0) > combat.range_for(unit.kind) {
+            let start = navigation.world_to_cell(position.0);
+            let goal_cell = navigation.world_to_cell(target_position.0);
+            let path = approach_path(&navigation, start, goal_cell);
+            commands.entity(entity).insert(MovePath(path.into()));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::units::{Selected, Unit};
+    use bevy::ecs::event::Events;
+    use bevy::utils::HashMap;
+
+    /// Fixed timestep used by all combat tests: 1/20 s per step.
+    const DT: f32 = 0.05;
+
+    struct TestApp {
+        app: App,
+    }
+
+    impl TestApp {
+        fn new() -> Self {
+            let mut app = App::new();
+            app.init_resource::<Time>()
+                .init_resource::<Time<Fixed>>()
+                .init_resource::<TimeUpdateStrategy>()
+                .insert_resource(NavigationGrid::default())
+                .insert_resource(CombatDefinition::default())
+                .add_event::<PlayerCommand>()
+                .add_systems(
+                    FixedUpdate,
+                    (
+                        apply_player_commands,
+                        opponent_ai_system.after(apply_player_commands),
+                        movement_system.after(opponent_ai_system),
+                        attack_system.after(movement_system),
+                        death_system.after(attack_system),
+                    ),
+                );
+            // Drive a constant fixed delta so cooldown math is exact.
+            app.edit_resource::<Time<Fixed>>(|fixed| {
+                fixed.set_timestep(DT, SpinMode::ManuallyAdvance);
+            });
+            TestApp { app }
+        }
+
+        fn spawn_unit(
+            &mut self,
+            kind: UnitKind,
+            owner: u8,
+            position: Vec2,
+            selected: bool,
+        ) -> Entity {
+            self.app.world_mut().spawn((
+                Unit { kind },
+                Player(owner),
+                Health {
+                    current: kind.max_hp(),
+                    max: kind.max_hp(),
+                },
+                MovePath::default(),
+                WorldPosition(position),
+                if selected { Some(Selected) } else { None },
+            ))
+        }
+
+        fn send(&mut self, command: PlayerCommand) {
+            self.app.world_mut().send_message(command);
+        }
+
+        fn step(&mut self) {
+            self.app.update();
+        }
+
+        fn steps(&mut self, count: usize) {
+            for _ in 0..count {
+                self.step();
+            }
+        }
+
+        fn health(&self, entity: Entity) -> Option<f32> {
+            self.app
+                .world()
+                .get::<Health>(entity)
+                .map(|health| health.current)
+        }
+
+        fn has_attack_order(&self, entity: Entity) -> bool {
+            self.app.world().get::<AttackOrder>(entity).is_some()
+        }
+
+        fn attack_target(&self, entity: Entity) -> Option<Entity> {
+            self.app
+                .world()
+                .get::<AttackOrder>(entity)
+                .map(|o| o.target)
+        }
+
+        fn cooldown(&self, entity: Entity) -> Option<f32> {
+            self.app.world().get::<AttackCooldown>(entity).map(|c| c.0)
+        }
+
+        fn position(&self, entity: Entity) -> Option<Vec2> {
+            self.app.world().get::<WorldPosition>(entity).map(|p| p.0)
+        }
+
+        fn alive_count(&self) -> usize {
+            self.app
+                .world()
+                .query_filtered::<(), With<Unit>>()
+                .iter(self.app.world())
+                .count()
+        }
+    }
+
+    #[test]
+    fn damage_kills_at_zero_health_and_despawns_the_unit() {
+        let mut test = TestApp::new();
+        let attacker = test.spawn_unit(UnitKind::Warrior, 0, Vec2::ZERO, true);
+        let target = test.spawn_unit(UnitKind::Peasant, 1, Vec2::X * 10.0, false);
+
+        test.send(PlayerCommand::Attack(target));
+        // Step 1 installs the cooldown without striking; step 2 lands hit one.
+        test.steps(2);
+        assert_eq!(test.health(target), Some(40.0 - 20.0));
+        assert!(test.app.world().get::<Dead>(target).is_none());
+
+        test.steps(20); // hit two brings the 40 HP peasant to zero.
+        assert!(
+            test.app.world().get::<Dead>(target).is_some(),
+            "lethal damage must mark the unit Dead inside the sim"
+        );
+        test.step(); // death_system despawns marked units.
+        assert!(test.health(target).is_none(), "dead units are removed");
+        assert!(
+            !test.has_attack_order(attacker),
+            "orders against dead targets drop"
+        );
+    }
+
+    #[test]
+    fn attacks_only_land_within_range() {
+        let mut test = TestApp::new();
+        // Warrior melee range is 30.0; place the target just outside it.
+        let attacker = test.spawn_unit(UnitKind::Warrior, 0, Vec2::ZERO, true);
+        let target = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 40.0, false);
+
+        test.send(PlayerCommand::Attack(target));
+        test.steps(60); // three full cooldown periods while out of reach
+        assert_eq!(test.health(target), Some(100.0), "no damage beyond range");
+        assert!(
+            test.has_attack_order(attacker),
+            "order persists while pursuing"
+        );
+
+        // Teleport into range: the next eligible step must deal damage.
+        let position = test.app.world().get_mut::<WorldPosition>(attacker).unwrap();
+        position.0 = Vec2::X * 20.0;
+        test.steps(2);
+        assert_eq!(test.health(target), Some(80.0), "damage once in range");
+    }
+
+    #[test]
+    fn attacks_follow_the_configured_cooldown() {
+        let mut test = TestApp::new();
+        let attacker = test.spawn_unit(UnitKind::Warrior, 0, Vec2::ZERO, true);
+        let target = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 10.0, false);
+
+        test.send(PlayerCommand::Attack(target));
+        test.steps(2); // first strike: 100 -> 80
+        assert_eq!(test.health(target), Some(80.0));
+        assert!(test.cooldown(attacker).is_some());
+
+        // Half a cooldown later (0.5 s at 1.0 s cadence): still only one hit.
+        test.steps(10);
+        assert_eq!(test.health(target), Some(80.0), "cooldown gates strikes");
+
+        // After a full cooldown elapses: second hit lands.
+        test.steps(10);
+        assert_eq!(test.health(target), Some(60.0));
+    }
+
+    #[test]
+    fn cooldown_scale_is_data_driven() {
+        let mut test = TestApp::new();
+        test.app.insert_resource(CombatDefinition {
+            cooldown_scale: 2.0,
+            ..default()
+        });
+        let attacker = test.spawn_unit(UnitKind::Warrior, 0, Vec2::ZERO, true);
+        let target = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 10.0, false);
+
+        test.send(PlayerCommand::Attack(target));
+        test.steps(2); // first strike at 20 damage
+        test.steps(20); // one default cooldown would have allowed a second hit
+        assert_eq!(
+            test.health(target),
+            Some(80.0),
+            "scaled cooldown halves rate"
+        );
+        test.steps(20); // the doubled cooldown (2 s) now allows the second hit
+        assert_eq!(test.health(target), Some(60.0));
+    }
+
+    #[test]
+    fn per_kind_damage_override_changes_lethality() {
+        let mut test = TestApp::new();
+        test.app.insert_resource(CombatDefinition {
+            warrior: KindCombat {
+                damage: Some(40.0),
+                ..default()
+            },
+            ..default()
+        });
+        let _attacker = test.spawn_unit(UnitKind::Warrior, 0, Vec2::ZERO, true);
+        let target = test.spawn_unit(UnitKind::Peasant, 1, Vec2::X * 10.0, false);
+
+        test.send(PlayerCommand::Attack(target));
+        test.steps(2); // one overridden 40-damage strike kills the 40 HP peasant
+        assert!(test.health(target).is_none() || test.app.world().get::<Dead>(target).is_some());
+    }
+
+    #[test]
+    fn move_order_cancels_the_attack_order() {
+        let mut test = TestApp::new();
+        let attacker = test.spawn_unit(UnitKind::Warrior, 0, Vec2::ZERO, true);
+        let target = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 10.0, false);
+
+        test.send(PlayerCommand::Attack(target));
+        test.step();
+        assert!(test.has_attack_order(attacker));
+
+        test.send(PlayerCommand::MoveSelected(Vec2::new(32.0, -8.0)));
+        test.step();
+        assert!(
+            !test.has_attack_order(attacker),
+            "move cancels attack order"
+        );
+        test.steps(40);
+        assert_eq!(
+            test.health(target),
+            Some(100.0),
+            "cancelled attacker never strikes"
+        );
+    }
+
+    #[test]
+    fn invalid_targets_are_rejected_or_dropped() {
+        let mut test = TestApp::new();
+        let attacker = test.spawn_unit(UnitKind::Warrior, 0, Vec2::ZERO, true);
+        let friendly = test.spawn_unit(UnitKind::Archer, 0, Vec2::X * 10.0, false);
+
+        // Friendly fire and non-unit entities are refused outright.
+        test.send(PlayerCommand::Attack(friendly));
+        test.send(PlayerCommand::Attack(Entity::from_raw(9_999)));
+        test.steps(4);
+        assert!(
+            !test.has_attack_order(attacker),
+            "invalid orders never attach"
+        );
+        assert_eq!(test.health(friendly), Some(60.0));
+
+        // An order whose target despawns mid-combat is dropped cleanly.
+        let victim = test.spawn_unit(UnitKind::Peasant, 1, Vec2::X * 10.0, false);
+        test.send(PlayerCommand::Attack(victim));
+        test.step();
+        assert_eq!(test.attack_target(attacker), Some(victim));
+        test.app.world_mut().despawn(victim);
+        test.step();
+        assert!(
+            !test.has_attack_order(attacker),
+            "stale orders drop when target vanishes"
+        );
+    }
+
+    #[test]
+    fn non_attacking_units_ignore_attack_orders() {
+        let mut test = TestApp::new();
+        let peasant = test.spawn_unit(UnitKind::Peasant, 0, Vec2::ZERO, true);
+        let target = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 10.0, false);
+
+        test.send(PlayerCommand::Attack(target));
+        test.steps(10);
+        assert!(!test.has_attack_order(peasant), "peasants cannot fight");
+        assert_eq!(test.health(target), Some(100.0));
+    }
+
+    #[test]
+    fn opponent_ai_attacks_back_and_retargets_after_death() {
+        let mut test = TestApp::new();
+        // Archer (range 90) outranges Warrior (melee 30): the enemy picks the
+        // closest player-0 unit on its own and starts firing immediately.
+        let archer = test.spawn_unit(UnitKind::Archer, 0, Vec2::ZERO, false);
+        let enemy = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 25.0, false);
+
+        test.steps(2); // AI assigns the order on the first step, strikes after cooldown
+        assert_eq!(test.attack_target(enemy), Some(archer));
+        assert_eq!(test.health(archer), Some(60.0 - 20.0));
+
+        // Kill the archer through the sim; the enemy must retarget or drop.
+        let hp = test.app.world().get_mut::<Health>(archer).unwrap();
+        hp.current = 0.0;
+        test.app
+            .world_mut()
+            .entity_mut(archer)
+            .insert(crate::core::units::Dead);
+        test.steps(3);
+        assert!(
+            test.health(archer).is_none(),
+            "death_system removes the corpse"
+        );
+        assert_ne!(
+            test.attack_target(enemy),
+            Some(archer),
+            "AI drops orders against dead targets"
+        );
+        assert_eq!(test.alive_count(), 1);
+    }
+
+    #[test]
+    fn opponent_ai_moves_into_range_of_far_targets() {
+        let mut test = TestApp::new();
+        let victim = test.spawn_unit(UnitKind::Peasant, 0, Vec2::ZERO, false);
+        let enemy = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 200.0, false);
+
+        test.steps(1);
+        assert_eq!(test.attack_target(enemy), Some(victim));
+        let moved = test.position(enemy).unwrap();
+        test.steps(20);
+        assert!(
+            test.position(enemy).unwrap().distance(moved) > 1.0,
+            "enemy walks toward its target"
+        );
     }
 }

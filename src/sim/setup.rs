@@ -54,8 +54,7 @@ pub fn spawn_initial_units(
     // A single enemy warrior (player 1) stands a few cells to the east so the
     // combat slice is playable: select a Warrior or Archer, right-click it.
     let enemy_cell = (anchor.0.saturating_add(8), anchor.1);
-    let enemy_pos = GameState::iso_pos(enemy_cell.0, enemy_cell.1)
-        + Vec2::new(0.0, -CELL_H / 2.0);
+    let enemy_pos = GameState::iso_pos(enemy_cell.0, enemy_cell.1) + Vec2::new(0.0, -CELL_H / 2.0);
     commands.spawn((
         Unit {
             kind: UnitKind::Warrior,
