@@ -330,7 +330,7 @@ fn attack_system(
         ),
         With<Player>,
     >,
-    mut targets: Query<(&WorldPosition, &mut Health), With<Unit>>,
+    mut targets: Query<(&WorldPosition, &mut Health), (With<Unit>, Without<Player>)>,
 ) {
     let dt = time.delta_secs();
     for (entity, unit, position, mut order, cooldown, attacker_health) in &mut attackers {
@@ -443,9 +443,8 @@ fn opponent_ai_system(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::units::{Selected, Unit};
-    use bevy::ecs::event::Events;
-    use bevy::utils::HashMap;
+    use crate::core::units::KindCombat;
+    use std::time::Duration;
 
     /// Fixed timestep used by all combat tests: 1/20 s per step.
     const DT: f32 = 0.05;
@@ -457,14 +456,11 @@ mod tests {
     impl TestApp {
         fn new() -> Self {
             let mut app = App::new();
-            app.init_resource::<Time>()
-                .init_resource::<Time<Fixed>>()
-                .init_resource::<TimeUpdateStrategy>()
-                .insert_resource(NavigationGrid::default())
+            app.insert_resource(NavigationGrid::default())
                 .insert_resource(CombatDefinition::default())
                 .add_event::<PlayerCommand>()
                 .add_systems(
-                    FixedUpdate,
+                    Update,
                     (
                         apply_player_commands,
                         opponent_ai_system.after(apply_player_commands),
@@ -473,10 +469,6 @@ mod tests {
                         death_system.after(attack_system),
                     ),
                 );
-            // Drive a constant fixed delta so cooldown math is exact.
-            app.edit_resource::<Time<Fixed>>(|fixed| {
-                fixed.set_timestep(DT, SpinMode::ManuallyAdvance);
-            });
             TestApp { app }
         }
 
@@ -487,24 +479,41 @@ mod tests {
             position: Vec2,
             selected: bool,
         ) -> Entity {
-            self.app.world_mut().spawn((
-                Unit { kind },
-                Player(owner),
-                Health {
-                    current: kind.max_hp(),
-                    max: kind.max_hp(),
-                },
-                MovePath::default(),
-                WorldPosition(position),
-                if selected { Some(Selected) } else { None },
-            ))
+            let entity = self
+                .app
+                .world_mut()
+                .spawn((
+                    Unit { kind },
+                    Player(owner),
+                    Health {
+                        current: kind.max_hp(),
+                        max: kind.max_hp(),
+                    },
+                    MovePath::default(),
+                    WorldPosition(position),
+                ))
+                .id();
+            if selected {
+                self.app.world_mut().entity_mut(entity).insert(Selected);
+            }
+            entity
         }
 
         fn send(&mut self, command: PlayerCommand) {
-            self.app.world_mut().send_message(command);
+            self.app.world_mut().send_event(command);
+            // Events are collected at the start of each schedule run, so flush
+            // one plain update (no fixed tick) to make the command visible to
+            // `apply_player_commands` on the next real step.
+            self.app.update();
         }
 
+        /// Advance the simulation by exactly one fixed step of `DT` seconds.
         fn step(&mut self) {
+            // The systems read `Time<Fixed>` for their delta, so set it to a
+            // constant DT before running the schedule. Events are cleared
+            // first so commands issued via `send` apply on the next step.
+            self.app.world_mut().resource_mut::<Events<PlayerCommand>>().clear();
+            self.app.insert_resource(Time::<Fixed>::from_duration(Duration::from_secs_f32(DT)));
             self.app.update();
         }
 
@@ -540,11 +549,11 @@ mod tests {
             self.app.world().get::<WorldPosition>(entity).map(|p| p.0)
         }
 
-        fn alive_count(&self) -> usize {
-            self.app
-                .world()
-                .query_filtered::<(), With<Unit>>()
-                .iter(self.app.world())
+        fn alive_count(&mut self) -> usize {
+            let world = self.app.world_mut();
+            world
+                .query_filtered::<Entity, With<Unit>>()
+                .iter(world)
                 .count()
         }
     }
@@ -590,8 +599,8 @@ mod tests {
         );
 
         // Teleport into range: the next eligible step must deal damage.
-        let position = test.app.world().get_mut::<WorldPosition>(attacker).unwrap();
-        position.0 = Vec2::X * 20.0;
+        let mut position = test.app.world_mut().get_mut::<WorldPosition>(attacker).unwrap();
+        position.0 = Vec2::X * 20.0; // borrow ends here, before the next step
         test.steps(2);
         assert_eq!(test.health(target), Some(80.0), "damage once in range");
     }
@@ -734,8 +743,10 @@ mod tests {
         assert_eq!(test.health(archer), Some(60.0 - 20.0));
 
         // Kill the archer through the sim; the enemy must retarget or drop.
-        let hp = test.app.world().get_mut::<Health>(archer).unwrap();
-        hp.current = 0.0;
+        {
+            let mut hp = test.app.world_mut().get_mut::<Health>(archer).unwrap();
+            hp.current = 0.0; // borrow ends at the end of this block
+        }
         test.app
             .world_mut()
             .entity_mut(archer)
