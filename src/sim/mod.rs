@@ -333,7 +333,7 @@ fn attack_system(
     mut targets: Query<(&WorldPosition, &mut Health), (With<Unit>, Without<Player>)>,
 ) {
     let dt = time.delta_secs();
-    for (entity, unit, position, mut order, cooldown, attacker_health) in &mut attackers {
+    for (entity, unit, position, order, cooldown, attacker_health) in &mut attackers {
         // A dead attacker no longer fights; death_system despawns it anyway.
         if attacker_health.is_some_and(|health| health.current <= 0.0) {
             continue;
@@ -444,6 +444,7 @@ fn opponent_ai_system(
 mod tests {
     use super::*;
     use crate::core::units::KindCombat;
+    use bevy::time::TimeUpdateStrategy;
     use std::time::Duration;
 
     /// Fixed timestep used by all combat tests: 1/20 s per step.
@@ -453,14 +454,30 @@ mod tests {
         app: App,
     }
 
+    /// Small walkable open area so units can path and approach targets.
+    const TEST_MAP: u32 = 64;
+
+    fn open_navigation_grid(size: u32) -> NavigationGrid {
+        NavigationGrid::open_field(size)
+    }
+
     impl TestApp {
         fn new() -> Self {
             let mut app = App::new();
-            app.insert_resource(NavigationGrid::default())
+            // Drive the fixed schedule manually: with `Manual` mode every call
+            // to `step()` below produces exactly one fixed tick of `DT`.
+            app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
+                DT,
+            )))
+                .insert_resource(Time::<Fixed>::from_duration(Duration::from_secs_f32(DT)))
+                .insert_resource(open_navigation_grid(TEST_MAP))
                 .insert_resource(CombatDefinition::default())
+                .init_resource::<PlayerEconomy>()
+                .init_resource::<ShedPlacement>()
+                .init_resource::<ShedDefinition>()
                 .add_event::<PlayerCommand>()
                 .add_systems(
-                    Update,
+                    FixedUpdate,
                     (
                         apply_player_commands,
                         opponent_ai_system.after(apply_player_commands),
@@ -501,19 +518,13 @@ mod tests {
 
         fn send(&mut self, command: PlayerCommand) {
             self.app.world_mut().send_event(command);
-            // Events are collected at the start of each schedule run, so flush
-            // one plain update (no fixed tick) to make the command visible to
-            // `apply_player_commands` on the next real step.
-            self.app.update();
         }
 
         /// Advance the simulation by exactly one fixed step of `DT` seconds.
         fn step(&mut self) {
-            // The systems read `Time<Fixed>` for their delta, so set it to a
-            // constant DT before running the schedule. Events are cleared
-            // first so commands issued via `send` apply on the next step.
-            self.app.world_mut().resource_mut::<Events<PlayerCommand>>().clear();
-            self.app.insert_resource(Time::<Fixed>::from_duration(Duration::from_secs_f32(DT)));
+            // Each app.update() advances real time by DT (ManualDuration), and
+            // a fixed step of DT is due every DT, so one update runs exactly
+            // one tick of the FixedUpdate schedule for the sim systems.
             self.app.update();
         }
 
@@ -558,6 +569,19 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn dbg_fixed_tick() {
+        let mut test = TestApp::new();
+        static TICKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        TICKS.store(0, std::sync::atomic::Ordering::SeqCst);
+        test.app.add_systems(FixedUpdate, || {
+            TICKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        for _ in 0..4 { test.step(); }
+        println!("ticks after 4 updates: {}", TICKS.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(TICKS.load(std::sync::atomic::Ordering::SeqCst) >= 1, "fixed schedule did not run");
+    }
     #[test]
     fn damage_kills_at_zero_health_and_despawns_the_unit() {
         let mut test = TestApp::new();
@@ -632,7 +656,7 @@ mod tests {
             cooldown_scale: 2.0,
             ..default()
         });
-        let attacker = test.spawn_unit(UnitKind::Warrior, 0, Vec2::ZERO, true);
+        let _attacker = test.spawn_unit(UnitKind::Warrior, 0, Vec2::ZERO, true);
         let target = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 10.0, false);
 
         test.send(PlayerCommand::Attack(target));

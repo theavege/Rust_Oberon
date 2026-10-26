@@ -19,6 +19,16 @@ pub struct NavigationGrid {
 }
 
 impl NavigationGrid {
+    /// Fully walkable grid of `size` x `size` cells (no reserved footprints).
+    /// Used by simulation tests that need pathing without a real map file.
+    pub fn open_field(size: u32) -> Self {
+        Self {
+            width: size,
+            height: size,
+            walkable: vec![true; (size * size) as usize],
+            reserved: vec![false; (size * size) as usize],
+        }
+    }
     /// Build walkability from the scheme's Earth surface. Sea, unmoveable and
     /// non-existent terrain types block units; other Earth terrain is usable.
     pub fn from_map(map: &MapFile, scheme: &Scheme) -> Self {
