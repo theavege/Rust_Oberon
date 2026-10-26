@@ -444,7 +444,7 @@ fn opponent_ai_system(
 mod tests {
     use super::*;
     use crate::core::units::KindCombat;
-    use bevy::time::TimeUpdateStrategy;
+    use bevy::time::{Fixed, TimeUpdateStrategy};
     use std::time::Duration;
 
     /// Fixed timestep used by all combat tests: 1/20 s per step.
@@ -463,21 +463,22 @@ mod tests {
 
     impl TestApp {
         fn new() -> Self {
+            // A bare `App` has no time machinery at all, so we set up the
+            // pieces the simulation systems read: `Time<Fixed>` defines the
+            // step length (`Res<Time<Fixed>>` in every system), and an empty
+            // `FixedMain` schedule hosts the sim systems. `step()` below then
+            // runs exactly one fixed tick deterministically, without relying
+            // on accumulators or wall-clock time.
             let mut app = App::new();
-            // Drive the fixed schedule manually: with `Manual` mode every call
-            // to `step()` below produces exactly one fixed tick of `DT`.
-            app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
-                DT,
-            )))
-                .insert_resource(Time::<Fixed>::from_duration(Duration::from_secs_f32(DT)))
-                .insert_resource(open_navigation_grid(TEST_MAP))
-                .insert_resource(CombatDefinition::default())
-                .init_resource::<PlayerEconomy>()
-                .init_resource::<ShedPlacement>()
-                .init_resource::<ShedDefinition>()
-                .add_event::<PlayerCommand>()
+            app.insert_resource(Time::<Fixed>::from_duration(Duration::from_secs_f32(DT)))
+                .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
+                    DT,
+                )))
+                .edit_schedule(FixedMain, |schedule| {
+                    *schedule = Schedule::default();
+                })
                 .add_systems(
-                    FixedUpdate,
+                    FixedMain,
                     (
                         apply_player_commands,
                         opponent_ai_system.after(apply_player_commands),
@@ -485,7 +486,13 @@ mod tests {
                         attack_system.after(movement_system),
                         death_system.after(attack_system),
                     ),
-                );
+                )
+                .insert_resource(open_navigation_grid(TEST_MAP))
+                .insert_resource(CombatDefinition::default())
+                .init_resource::<PlayerEconomy>()
+                .init_resource::<ShedPlacement>()
+                .init_resource::<ShedDefinition>()
+                .add_event::<PlayerCommand>();
             TestApp { app }
         }
 
@@ -522,10 +529,16 @@ mod tests {
 
         /// Advance the simulation by exactly one fixed step of `DT` seconds.
         fn step(&mut self) {
-            // Each app.update() advances real time by DT (ManualDuration), and
-            // a fixed step of DT is due every DT, so one update runs exactly
-            // one tick of the FixedUpdate schedule for the sim systems.
-            self.app.update();
+            // Deterministic manual tick: set up the clock state that Bevy's
+            // fixed-step loop would build (`Time` mirrors `Time<Fixed>`), run
+            // the `FixedMain` schedule once, then apply the per-step delta so
+            // systems reading `Res<Time<Fixed>>::delta_secs()` see exactly
+            // `DT`. No accumulators or wall-clock time are involved.
+            let world = self.app.world_mut();
+            let timestep = world.resource::<Time<Fixed>>().timestep();
+            *world.resource_mut::<Time>() = world.resource::<Time<Fixed>>().as_generic();
+            world.resource_mut::<Time<Fixed>>().advance_by(timestep);
+            world.run_schedule(FixedMain);
         }
 
         fn steps(&mut self, count: usize) {
@@ -570,18 +583,6 @@ mod tests {
     }
 
 
-    #[test]
-    fn dbg_fixed_tick() {
-        let mut test = TestApp::new();
-        static TICKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        TICKS.store(0, std::sync::atomic::Ordering::SeqCst);
-        test.app.add_systems(FixedUpdate, || {
-            TICKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        });
-        for _ in 0..4 { test.step(); }
-        println!("ticks after 4 updates: {}", TICKS.load(std::sync::atomic::Ordering::SeqCst));
-        assert!(TICKS.load(std::sync::atomic::Ordering::SeqCst) >= 1, "fixed schedule did not run");
-    }
     #[test]
     fn damage_kills_at_zero_health_and_despawns_the_unit() {
         let mut test = TestApp::new();
