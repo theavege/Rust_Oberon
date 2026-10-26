@@ -8,8 +8,9 @@ use bevy::prelude::*;
 use crate::core::{
     map::NavigationGrid,
     units::{
-        Building, ConstructionSite, HarvestOrder, MovePath, Player, PlayerCommand, PlayerEconomy,
-        ResourceNode, Selected, ShedDefinition, ShedPlacement, Unit, UnitKind, WorldPosition,
+        AttackCooldown, AttackOrder, Building, CombatDefinition, ConstructionSite, Dead,
+        HarvestOrder, Health, MovePath, Player, PlayerCommand, PlayerEconomy, ResourceNode,
+        Selected, ShedDefinition, ShedPlacement, Unit, UnitKind, WorldPosition,
     },
 };
 
@@ -26,6 +27,8 @@ impl Plugin for SimPlugin {
                     movement_system,
                     harvest_system.after(movement_system),
                     construction_system.after(harvest_system),
+                    attack_system.after(construction_system),
+                    death_system.after(attack_system),
                 ),
             );
     }
@@ -37,11 +40,10 @@ fn apply_player_commands(
     mut navigation: ResMut<NavigationGrid>,
     mut economy: ResMut<PlayerEconomy>,
     shed: Res<ShedDefinition>,
-    units: Query<
-        (Entity, &Unit, Option<&Selected>, &WorldPosition),
-        (With<Player>, Without<ResourceNode>),
-    >,
+    units: Query<(Entity, &Unit, Option<&Selected>, &WorldPosition), With<Player>>,
     nodes: Query<&WorldPosition, (With<ResourceNode>, Without<Unit>)>,
+    enemy_targets: Query<(&Health, &Player, &WorldPosition), With<Unit>>,
+    combat: Res<CombatDefinition>,
 ) {
     for message in messages.read() {
         match *message {
@@ -67,6 +69,7 @@ fn apply_player_commands(
                         commands
                             .entity(entity)
                             .remove::<HarvestOrder>()
+                            .remove::<AttackOrder>()
                             .insert(MovePath(path.into()));
                     }
                 }
@@ -118,7 +121,64 @@ fn apply_player_commands(
                     WorldPosition(footprint_center(origin, shed.footprint)),
                 ));
             }
+            PlayerCommand::Attack(target) => {
+                // Validate the target: it must be a unit and not belong to the
+                // issuing player (no friendly fire, no attacking scenery).
+                let Ok((target_health, target_player, target_position)) =
+                    enemy_targets.get(target)
+                else {
+                    continue;
+                };
+                if target_player.0 == 0 || target_health.current <= 0.0 {
+                    continue;
+                }
+                for (entity, unit, selected, position) in &units {
+                    if selected.is_none() || !unit.kind.can_attack() {
+                        continue;
+                    }
+                    commands.entity(entity).insert((
+                        AttackOrder { target },
+                        AttackCooldown::default(),
+                    ));
+                    // Move into range if we are not already there. Approach one
+                    // cell short of the target so units settle adjacent to it.
+                    let distance = position.0.distance(target_position.0);
+                    if distance > combat.range_for(unit.kind) {
+                        let start = navigation.world_to_cell(position.0);
+                        let goal_cell = navigation.world_to_cell(target_position.0);
+                        let path = approach_path(&navigation, start, goal_cell);
+                        commands.entity(entity).insert(MovePath(path.into()));
+                    }
+                }
+            }
         }
+    }
+}
+
+/// Path an attacking unit walks to reach a target standing on `goal`: aim for
+/// the walkable neighbor cell closest to the attacker so it stops adjacent to
+/// (and in range of) the target instead of walking onto its cell.
+fn approach_path(navigation: &NavigationGrid, start: IVec2, goal: IVec2) -> Vec<IVec2> {
+    const NEIGHBORS: [(i32, i32); 8] = [
+        (-1, 0),
+        (1, 0),
+        (0, -1),
+        (0, 1),
+        (-1, -1),
+        (-1, 1),
+        (1, -1),
+        (1, 1),
+    ];
+    let best = NEIGHBORS
+        .iter()
+        .map(|&(dx, dy)| goal + IVec2::new(dx, dy))
+        .filter(|&cell| navigation.is_walkable(cell))
+        .min_by_key(|&cell| {
+            (cell.x - start.x).unsigned_abs() + (cell.y - start.y).unsigned_abs()
+        });
+    match best.or_else(|| navigation.nearest_walkable(goal)) {
+        Some(cell) => navigation.find_path(start, cell).unwrap_or_default(),
+        None => Vec::new(),
     }
 }
 
@@ -154,7 +214,7 @@ fn update_shed_placement(
     navigation: Res<NavigationGrid>,
     economy: Res<PlayerEconomy>,
     shed: Res<ShedDefinition>,
-    units: Query<&WorldPosition, (With<Unit>, With<Player>, Without<ResourceNode>)>,
+    units: Query<&WorldPosition, (With<Unit>, With<Player>)>,
     mut placement: ResMut<ShedPlacement>,
 ) {
     if !placement.active {
@@ -180,7 +240,7 @@ fn harvest_system(
     mut commands: Commands,
     mut workers: Query<
         (Entity, &WorldPosition, &mut HarvestOrder),
-        (With<Unit>, With<Player>, Without<ResourceNode>),
+        (With<Unit>, With<Player>),
     >,
     mut nodes: Query<(&WorldPosition, &mut ResourceNode), Without<Unit>>,
 ) {
@@ -255,5 +315,73 @@ fn movement_system(
         }
         let next = pos + delta.normalize() * step;
         position.0 = next;
+    }
+}
+
+/// Fixed-step combat resolution: units with an `AttackOrder` move toward their
+/// target (handled by `movement_system`) and strike whenever the target is in
+/// range and the cooldown has elapsed. Invalid or dead targets are dropped.
+fn attack_system(
+    time: Res<Time<Fixed>>,
+    combat: Res<CombatDefinition>,
+    mut commands: Commands,
+    mut attackers: Query<(
+        Entity,
+        &Unit,
+        &WorldPosition,
+        &mut AttackOrder,
+        Option<&mut AttackCooldown>,
+        Option<&Health>,
+    )>,
+    mut targets: Query<(&WorldPosition, &mut Health), With<Unit>>,
+) {
+    let dt = time.delta_secs();
+    for (entity, unit, position, mut order, cooldown, attacker_health) in &mut attackers {
+        // A dead attacker no longer fights; death_system despawns it anyway.
+        if attacker_health.is_some_and(|health| health.current <= 0.0) {
+            continue;
+        }
+        // Drop stale orders: the target must still exist and be alive.
+        let target_alive = match targets.get(order.target) {
+            Ok((_, health)) => health.current > 0.0,
+            Err(_) => false,
+        };
+        if !target_alive {
+            commands.entity(entity).remove::<AttackOrder>();
+            continue;
+        }
+
+        let Some(mut cooldown) = cooldown else {
+            // First step after issuing the order: wait one tick so attacks
+            // follow the configured cadence from the moment they enter range.
+            continue;
+        };
+        if cooldown.0 > 0.0 {
+            cooldown.0 = (cooldown.0 - dt).max(0.0);
+            continue;
+        }
+        let distance = match targets.get(order.target) {
+            Ok((target_position, _)) => position.0.distance(target_position.0),
+            Err(_) => continue,
+        };
+        if distance > combat.range_for(unit.kind) {
+            continue;
+        }
+
+        let damage = combat.damage_for(unit.kind);
+        if let Ok((_, mut health)) = targets.get_mut(order.target) {
+            if health.take_damage(damage) {
+                commands.entity(order.target).insert(Dead);
+            }
+        }
+        cooldown.0 = combat.cooldown_for(unit.kind);
+    }
+}
+
+/// Remove units that reached zero health inside the fixed-step simulation,
+/// independently of rendering.
+fn death_system(mut commands: Commands, dead: Query<Entity, With<Dead>>) {
+    for entity in &dead {
+        commands.entity(entity).despawn();
     }
 }

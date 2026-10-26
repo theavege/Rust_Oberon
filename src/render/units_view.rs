@@ -5,8 +5,8 @@ use bevy::sprite::Anchor;
 
 use crate::core::map::NavigationGrid;
 use crate::core::units::{
-    Building, ConstructionSite, Player, PlayerCommand, PlayerEconomy, ResourceNode, Selected,
-    ShedDefinition, ShedPlacement, Unit, WorldPosition,
+    Building, CombatDefinition, ConstructionSite, Dead, Health, Player, PlayerCommand,
+    PlayerEconomy, ResourceNode, Selected, ShedDefinition, ShedPlacement, Unit, WorldPosition,
 };
 
 /// Marker for unit visuals so we can find unsynced entities.
@@ -18,7 +18,7 @@ pub fn unit_input(
     windows: Query<&Window>,
     cameras: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
     mut commands: EventWriter<PlayerCommand>,
-    units: Query<(Entity, &Transform), (With<Unit>, With<Player>)>,
+    units: Query<(Entity, &Transform, Option<&Player>), With<Unit>>,
     resource_nodes: Query<(Entity, &Transform), With<ResourceNode>>,
 ) {
     let Ok(window) = windows.single() else { return };
@@ -35,7 +35,7 @@ pub fn unit_input(
     if buttons.just_pressed(MouseButton::Left) {
         let target = units
             .iter()
-            .map(|(entity, transform)| {
+            .map(|(entity, transform, _)| {
                 (entity, transform.translation.truncate().distance(world_pos))
             })
             .filter(|(_, distance)| *distance <= 22.0)
@@ -44,6 +44,25 @@ pub fn unit_input(
         commands.write(PlayerCommand::Select(target));
     }
     if buttons.just_pressed(MouseButton::Right) {
+        // Right-click on an enemy unit issues an attack order; on a resource
+        // node it harvests; otherwise it moves.
+        let clicked_unit = units
+            .iter()
+            .map(|(entity, transform, owner)| {
+                (
+                    entity,
+                    owner.map(|player| player.0),
+                    transform.translation.truncate().distance(world_pos),
+                )
+            })
+            .filter(|(_, _, distance)| *distance <= 22.0)
+            .min_by(|a, b| a.2.total_cmp(&b.2));
+        if let Some((entity, Some(owner), _)) = clicked_unit {
+            if owner != 0 {
+                commands.write(PlayerCommand::Attack(entity));
+                return;
+            }
+        }
         let resource = resource_nodes
             .iter()
             .map(|(entity, transform)| {
@@ -305,17 +324,65 @@ pub fn sync_unit_sprites(
     mut commands: Commands,
     q: Query<(Entity, &Unit, &Player, &WorldPosition), Without<UnitSprite>>,
 ) {
-    for (entity, unit, _player, position) in q.iter() {
+    for (entity, unit, player, position) in q.iter() {
         // Transform is a presentation copy of the simulation's world position.
+        let base = if player.0 == 0 {
+            unit.kind.color()
+        } else {
+            enemy_tint(unit.kind)
+        };
         commands.entity(entity).insert((
             Sprite {
-                color: unit.kind.color(),
+                color: base,
                 custom_size: Some(Vec2::splat(26.0)),
                 ..default()
             },
             UnitSprite,
+            HealthBarBase(base),
             Transform::from_xyz(position.0.x, position.0.y, 1.0),
         ));
+    }
+}
+
+/// Distinguish enemy units by darkening their kind color slightly.
+fn enemy_tint(kind: UnitKind) -> Color {
+    let Color::srgb(r, g, b) = kind.color() else {
+        return kind.color();
+    };
+    Color::srgb(r * 0.75, g * 0.35, b * 0.35)
+}
+
+/// Remembers the sprite's non-damage tint so health shading composes correctly.
+#[derive(Component)]
+pub struct HealthBarBase(pub Color);
+
+/// Clear visual feedback for health and death: damaged units darken toward red
+/// as HP drops, dying units flash bright red (before the sim despawns them),
+/// and enemy units carry a distinct tint. Selection is shown by size only.
+pub fn show_health(
+    mut sprites: Query<
+        (Entity, &mut Sprite, &HealthBarBase, &Health),
+        (With<Unit>, Without<Building>),
+    >,
+    dead: Query<(), With<Dead>>,
+) {
+    for (entity, mut sprite, base, health) in &mut sprites {
+        if dead.get(entity).is_ok() {
+            sprite.color = Color::srgb(1.0, 0.15, 0.1);
+            continue;
+        }
+        let ratio = (health.current / health.max).clamp(0.0, 1.0);
+        // Blend from the unit's base color toward red as health drops.
+        let Color::srgb(br, bg, bb) = base.0 else {
+            sprite.color = base.0;
+            continue;
+        };
+        let damage = 1.0 - ratio;
+        sprite.color = Color::srgb(
+            br * ratio + 0.85 * damage,
+            bg * ratio * 0.7,
+            bb * ratio * 0.7,
+        );
     }
 }
 
@@ -328,11 +395,51 @@ pub fn sync_unit_transforms(mut q: Query<(&WorldPosition, &mut Transform), With<
 
 pub fn show_selection(mut q: Query<(&Unit, Option<&Selected>, &mut Sprite)>) {
     for (unit, selected, mut sprite) in &mut q {
-        sprite.color = if selected.is_some() {
-            Color::srgb(1.0, 1.0, 0.55)
-        } else {
-            unit.kind.color()
-        };
+        // Selection is shown by size only; color carries health feedback
+        // (see `show_health`), which runs after this system.
+        let _ = unit;
         sprite.custom_size = Some(Vec2::splat(if selected.is_some() { 34.0 } else { 26.0 }));
+    }
+}
+
+/// Short-lived red flash where a unit died, so death reads clearly on screen.
+#[derive(Component)]
+pub struct DeathFlash {
+    pub remaining: f32,
+}
+
+pub fn spawn_death_flashes(
+    mut commands: Commands,
+    removed: RemovedComponents<Unit>,
+    positions: Query<&WorldPosition>,
+) {
+    for entity in removed.read() {
+        if let Ok(position) = positions.get(entity) {
+            commands.spawn((
+                Sprite {
+                    color: Color::srgba(1.0, 0.2, 0.1, 0.9),
+                    custom_size: Some(Vec2::splat(30.0)),
+                    ..default()
+                },
+                Transform::from_xyz(position.0.x, position.0.y, 1.5),
+                DeathFlash { remaining: 0.5 },
+            ));
+        }
+    }
+}
+
+pub fn fade_death_flashes(
+    time: Res<Time>,
+    mut commands: Commands,
+    mut flashes: Query<(Entity, &mut DeathFlash, &mut Sprite)>,
+) {
+    for (entity, mut flash, mut sprite) in &mut flashes {
+        flash.remaining -= time.delta_secs();
+        let alpha = (flash.remaining / 0.5).clamp(0.0, 1.0);
+        if alpha <= 0.0 {
+            commands.entity(entity).despawn();
+        } else if let Color::Srgba(rgba) = &mut sprite.color {
+            rgba.alpha = alpha * 0.9;
+        }
     }
 }

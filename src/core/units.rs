@@ -27,6 +27,38 @@ impl UnitKind {
         }
     }
 
+    /// Damage dealt per successful attack (data-driven via `CombatDefinition`).
+    pub fn damage(self) -> f32 {
+        match self {
+            UnitKind::Peasant => 0.0, // peasants do not fight
+            UnitKind::Warrior => 20.0,
+            UnitKind::Archer => 15.0,
+        }
+    }
+
+    /// Attack range in isometric world units (one map cell is ~17 px diagonal).
+    pub fn attack_range(self) -> f32 {
+        match self {
+            UnitKind::Peasant => 0.0,
+            UnitKind::Warrior => 30.0, // melee
+            UnitKind::Archer => 90.0,  // ranged
+        }
+    }
+
+    /// Seconds between two attacks by the same unit.
+    pub fn attack_cooldown(self) -> f32 {
+        match self {
+            UnitKind::Peasant => 1.0,
+            UnitKind::Warrior => 1.0,
+            UnitKind::Archer => 1.5,
+        }
+    }
+
+    /// True when this kind can receive and execute attack orders.
+    pub fn can_attack(self) -> bool {
+        self.damage() > 0.0
+    }
+
     pub fn color(self) -> Color {
         match self {
             UnitKind::Peasant => Color::srgb(0.9, 0.8, 0.3),
@@ -42,6 +74,32 @@ pub struct Health {
     pub current: f32,
     pub max: f32,
 }
+
+impl Health {
+    /// Apply damage; returns true when this hit brought the unit to zero.
+    pub fn take_damage(&mut self, amount: f32) -> bool {
+        if amount <= 0.0 {
+            return self.current <= 0.0;
+        }
+        self.current = (self.current - amount).max(0.0);
+        self.current <= 0.0
+    }
+}
+
+/// Seconds until this unit may attack again (combat cooldown state).
+#[derive(Component, Debug, Default)]
+pub struct AttackCooldown(pub f32);
+
+/// The unit's current attack order and target.
+#[derive(Component, Debug)]
+pub struct AttackOrder {
+    pub target: Entity,
+}
+
+/// Marks a unit that has died this step; removed by the cleanup system so the
+/// death rule stays in the simulation and out of rendering.
+#[derive(Component, Debug)]
+pub struct Dead;
 
 /// Grid route generated for the unit's current movement order.
 #[derive(Component, Debug, Default)]
@@ -68,6 +126,40 @@ pub struct ShedDefinition {
     pub footprint: IVec2,
     pub wood_cost: u32,
     pub construction_seconds: f32,
+}
+
+/// Data-driven combat tuning. The per-kind damage/range/cooldown defaults come
+/// from `UnitKind`; this resource lets those rules be overridden (and later,
+/// loaded from content data) without touching simulation code.
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct CombatDefinition {
+    /// Multiplier applied to every attack's damage.
+    pub damage_scale: f32,
+    /// Multiplier applied to every unit's attack cooldown.
+    pub cooldown_scale: f32,
+}
+
+impl Default for CombatDefinition {
+    fn default() -> Self {
+        Self {
+            damage_scale: 1.0,
+            cooldown_scale: 1.0,
+        }
+    }
+}
+
+impl CombatDefinition {
+    pub fn damage_for(&self, kind: UnitKind) -> f32 {
+        kind.damage() * self.damage_scale
+    }
+
+    pub fn range_for(&self, kind: UnitKind) -> f32 {
+        kind.attack_range()
+    }
+
+    pub fn cooldown_for(&self, kind: UnitKind) -> f32 {
+        kind.attack_cooldown() * self.cooldown_scale
+    }
 }
 
 impl Default for ShedDefinition {
@@ -122,4 +214,6 @@ pub enum PlayerCommand {
     MoveSelected(Vec2),
     Harvest(Entity),
     PlaceShed(IVec2),
+    /// Order every selected attack-capable unit to attack the target unit.
+    Attack(Entity),
 }

@@ -37,6 +37,7 @@ impl Plugin for CorePlugin {
             .init_resource::<map::NavigationGrid>()
             .init_resource::<units::PlayerEconomy>()
             .init_resource::<units::ShedDefinition>()
+            .init_resource::<units::CombatDefinition>()
             .init_resource::<units::ShedPlacement>()
             .add_plugins(gamestate::DataPlugin);
     }

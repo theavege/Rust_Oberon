@@ -50,4 +50,22 @@ pub fn spawn_initial_units(
             .unwrap_or_else(|| GameState::iso_pos(x, y) + Vec2::new(0.0, -CELL_H / 2.0));
         commands.spawn((ResourceNode { wood: 30 }, WorldPosition(pos)));
     }
+
+    // A single enemy warrior (player 1) stands a few cells to the east so the
+    // combat slice is playable: select a Warrior or Archer, right-click it.
+    let enemy_cell = (anchor.0.saturating_add(8), anchor.1);
+    let enemy_pos = GameState::iso_pos(enemy_cell.0, enemy_cell.1)
+        + Vec2::new(0.0, -CELL_H / 2.0);
+    commands.spawn((
+        Unit {
+            kind: UnitKind::Warrior,
+        },
+        Player(1),
+        Health {
+            current: UnitKind::Warrior.max_hp(),
+            max: UnitKind::Warrior.max_hp(),
+        },
+        MovePath::default(),
+        WorldPosition(enemy_pos),
+    ));
 }
