@@ -3,8 +3,11 @@
 
 pub mod setup;
 
-use bevy::ecs::schedule::EntityWorldMut;
+use bevy::ecs::world::EntityWorldMut;
+use bevy::app::FixedMain;
 use bevy::prelude::*;
+use bevy::time::TimeUpdateStrategy;
+use std::time::Duration;
 
 use crate::core::{
     map::NavigationGrid,
@@ -27,7 +30,7 @@ impl Plugin for SimPlugin {
             .add_systems(Update, (apply_player_commands, update_shed_placement))
             // The simulation runs on `FixedMain`, driven at a fixed frequency
             // by the time plugin's catch-up loop. Tests drive the same
-            // schedule deterministically with a virtual clock.
+            // schedule deterministically with a manual virtual clock.
             .insert_resource(TimeUpdateStrategy::ManualDuration(
                 Duration::from_secs_f64(SIM_STEP_SECONDS),
             ))
@@ -503,7 +506,6 @@ mod tests {
     use super::*;
     use crate::core::units::KindCombat;
     use bevy::time::Virtual;
-    use std::time::Duration;
 
     /// Nominal fixed-timestep duration in seconds. The virtual clock is
     /// advanced by exactly this amount per `step()`, so every call runs one
@@ -534,7 +536,7 @@ mod tests {
             // production (commands flush before the fixed combat step runs).
             .add_systems(Update, apply_player_commands)
             .add_systems(
-                FixedUpdate,
+                FixedMain,
                 (
                     opponent_ai_system,
                     movement_system.after(opponent_ai_system),
@@ -567,12 +569,11 @@ mod tests {
 
         fn with_combat(combat: CombatDefinition) -> Self {
             let mut app = combat_test_app(combat);
-            // Prime the fixed timestep so the first `step()` below behaves
-            // exactly like every later one (one event flush + one sim tick).
+            // Prime the loop once. With `TimeUpdateStrategy::ManualDuration`
+            // every update has a delta of exactly one timestep, so this first
+            // `app.update()` runs one full fixed tick; tests account for it in
+            // their step budgets (e.g. "strike after two steps" = prime + 1).
             app.update();
-            app.world_mut()
-                .resource_mut::<Time<Virtual>>()
-                .advance_by(Duration::from_secs_f32(DT));
             TestApp { app }
         }
 
@@ -608,17 +609,13 @@ mod tests {
         }
 
         /// Advance the simulation by exactly one fixed step of `DT` seconds.
-        /// Bevy's virtual clock advances at the END of `app.update()`, so the
-        /// tick due from the PREVIOUS advance runs during the first call here:
-        /// pending events flush through `apply_player_commands` on `Update`
-        /// before the production fixed-step systems run against that state.
-        /// The second advance arms exactly one more tick for the next `step()`.
+        /// The time plugin runs with `TimeUpdateStrategy::ManualDuration(DT)`,
+        /// so each `app.update()` produces a virtual delta of precisely `DT`
+        /// and the fixed-step driver executes exactly one `FixedMain` tick.
+        /// Pending events flush through `apply_player_commands` on `Update`
+        /// before the fixed combat systems run, matching production ordering.
         fn step(&mut self) {
             self.app.update();
-            self.app
-                .world_mut()
-                .resource_mut::<Time<Virtual>>()
-                .advance_by(Duration::from_secs_f32(DT));
         }
 
         fn steps(&mut self, count: usize) {
