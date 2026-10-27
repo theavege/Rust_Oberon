@@ -370,23 +370,24 @@ fn attack_system(
             continue;
         }
 
+        // Ensure the cooldown component exists (ready to strike) even while
+        // still out of range, so no update-command conflict builds up across
+        // steps and the first eligible step in range always lands a hit.
+        let distance = living
+            .iter()
+            .find(|(id, ..)| *id == order.target)
+            .map_or(f32::INFINITY, |(_, _, target_position)| {
+                position.0.distance(*target_position)
+            });
         let Some(mut cooldown) = cooldown else {
-            // First step after issuing the order: start the cooldown component
-            // ready so the unit strikes as soon as it is in range.
             commands.entity(entity).insert(AttackCooldown(0.0));
             continue;
         };
-        if cooldown.0 > 0.0 {
-            cooldown.0 = (cooldown.0 - dt).max(0.0);
+        if distance > combat.range_for(unit.kind) {
             continue;
         }
-        let Some((_, _, target_position)) =
-            living.iter().find(|(id, ..)| *id == order.target)
-        else {
-            continue;
-        };
-        let distance = position.0.distance(*target_position);
-        if distance > combat.range_for(unit.kind) {
+        if cooldown.0 > 0.0 {
+            cooldown.0 = (cooldown.0 - dt).max(0.0);
             continue;
         }
 
@@ -472,7 +473,7 @@ fn opponent_ai_system(
 mod tests {
     use super::*;
     use crate::core::units::KindCombat;
-    use bevy::time::{TimePlugin, Virtual};
+    use bevy::time::Virtual;
     use std::time::Duration;
 
     /// Fixed timestep used by all combat tests: 1/20 s per step.
@@ -490,8 +491,9 @@ mod tests {
     /// precisely one fixed tick — fully deterministic.
     fn combat_test_app(combat: CombatDefinition) -> App {
         let mut app = App::new();
+        // `MinimalPlugins` already provides `TimePlugin`, so only the virtual
+        // clock resource is added here.
         app.add_plugins(MinimalPlugins)
-            .add_plugins(TimePlugin)
             .insert_resource(Time::<Virtual>::default())
 
             .insert_resource(open_grid())
@@ -500,6 +502,10 @@ mod tests {
             .init_resource::<ShedPlacement>()
             .init_resource::<ShedDefinition>()
             .add_event::<PlayerCommand>()
+            // Player commands are applied on `Update` in the real game; tests
+            // drive the same schedule so `send(...)` + `step()` behaves like
+            // production (commands flush before the fixed combat step runs).
+            .add_systems(Update, apply_player_commands)
             .add_systems(
                 FixedUpdate,
                 (
@@ -516,6 +522,15 @@ mod tests {
         app.world_mut()
             .resource_mut::<Time<Virtual>>()
             .set_relative_speed(multiplier as f32);
+        // `TimePlugin` defers event flushing until a fixed tick actually runs
+        // (so `FixedUpdate` systems can see events). With the default 0.99 s
+        // timestep, no tick would ever be due in these short tests and events
+        // would vanish unconsumed. Use a `DT` timestep instead: every virtual
+        // advance of `UPDATE_PERIOD` then executes exactly one fixed step and
+        // flushes events — deterministic one-to-one steps.
+        app.world_mut()
+            .resource_mut::<Time<Fixed>>()
+            .set_timestep_seconds(DT as f64);
         app
     }
 
