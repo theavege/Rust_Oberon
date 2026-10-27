@@ -3,6 +3,7 @@
 
 pub mod setup;
 
+use bevy::ecs::schedule::EntityWorldMut;
 use bevy::prelude::*;
 
 use crate::core::{
@@ -14,6 +15,9 @@ use crate::core::{
     },
 };
 
+/// Nominal fixed timestep of the simulation, in seconds (20 Hz).
+pub const SIM_STEP_SECONDS: f64 = 0.05;
+
 pub struct SimPlugin;
 
 impl Plugin for SimPlugin {
@@ -21,8 +25,14 @@ impl Plugin for SimPlugin {
         app.add_systems(Startup, setup::spawn_initial_units)
             .add_event::<PlayerCommand>()
             .add_systems(Update, (apply_player_commands, update_shed_placement))
+            // The simulation runs on `FixedMain`, driven at a fixed frequency
+            // by the time plugin's catch-up loop. Tests drive the same
+            // schedule deterministically with a virtual clock.
+            .insert_resource(TimeUpdateStrategy::ManualDuration(
+                Duration::from_secs_f64(SIM_STEP_SECONDS),
+            ))
             .add_systems(
-                FixedUpdate,
+                FixedMain,
                 (
                     opponent_ai_system,
                     movement_system.after(opponent_ai_system),
