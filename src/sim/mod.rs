@@ -4,7 +4,6 @@
 pub mod setup;
 
 use bevy::app::FixedMain;
-use bevy::ecs::world::EntityWorldMut;
 use bevy::prelude::*;
 use bevy::time::TimeUpdateStrategy;
 use std::collections::{HashMap, HashSet};
@@ -394,14 +393,17 @@ fn attack_system(
         ),
         (With<Unit>, With<Attacking>),
     >,
-    // Pure victims — every unit not marked as attacking this tick. Their
-    // `Health` is disjoint from the fighter query above
-    // (`Without<Attacking>`), so damage lands in place and a second strike
-    // inside the same tick sees the reduced health. Victims are read-only
-    // here; their snapshot rows come from this same query.
+    // Pure victims — every unit not holding an attack order this tick. The
+    // fighter query filters `With<Attacking>` and the invariant "every
+    // AttackOrder implies the Attacking marker" (maintained by all order
+    // assignments) means no entity appears in both queries, so the scheduler
+    // can prove their `Health` access disjoint even though both mutate it:
+    // damage lands in place and a second strike inside the same tick sees
+    // the reduced health.
+    #[allow(clippy::type_complexity)]
     mut victims: Query<
-        (Entity, &Player, &WorldPosition, &Health),
-        (With<Unit>, Without<Attacking>),
+        (Entity, &Player, &WorldPosition, &mut Health),
+        (With<Unit>, Without<AttackOrder>),
     >,
 ) {
     // The cooldown is a countdown clock, so it must advance by exactly one
@@ -435,7 +437,10 @@ fn attack_system(
     // Snapshot the fighters (units marked `Attacking`) together with their
     // live health and cooldown clocks before any mutable pass runs; the
     // decision loop below works purely on this data, and every write goes
-    // back through the fighter query afterwards.
+    // back through the fighter query afterwards. Fighters are also valid
+    // attack targets, so keep lookup tables for their rows as well — the
+    // damage pass uses `attacking_rows` to route hits to the in-place
+    // fighter query instead of the disjoint victim query.
     #[allow(clippy::type_complexity)]
     let fighter_snapshot: Vec<(Entity, UnitKind, Vec2, u8, Entity, f32, Option<f32>)> = fighters
         .iter()
@@ -453,6 +458,14 @@ fn attack_system(
             },
         )
         .collect();
+    let attacking_rows: HashSet<Entity> = fighter_snapshot.iter().map(|row| row.0).collect();
+    #[allow(clippy::type_complexity)]
+    let fighter_rows: HashMap<Entity, (u8, Vec2, f32)> = fighter_snapshot
+        .iter()
+        .map(|&(entity, _, position, owner, _, health, _)| {
+            (entity, (owner, position, health))
+        })
+        .collect();
 
     // Decide every strike for this tick first, then apply them in one pass.
     let mut pending_damage: Vec<(Entity, f32)> = Vec::new();
@@ -468,18 +481,15 @@ fn attack_system(
 
     for &(entity, kind, position, owner, target, health, cooldown) in &fighter_snapshot {
         // Drop stale orders: the target must still exist, be alive, and not
-        // belong to the attacker's own player (no friendly fire).
-        let target_row = rows.get(&target);
-        let target_ok = target_row
-            .is_some_and(|(player, _, health, _)| *player != owner && *health > 0.0);
+        // belong to the attacker's own player (no friendly fire). Targets may
+        // be pure victims or fellow fighters, so look in both row sources.
+        let target_ok = target_is_valid(&rows, &fighter_rows, target, owner);
         if !target_ok {
             stale_orders.push(entity);
             continue;
         }
 
-        let distance = target_row.map_or(f32::INFINITY, |(_, target_position, _, _)| {
-            position.distance(*target_position)
-        });
+        let distance = target_distance(&rows, &fighter_rows, target, position);
         // A freshly assigned order starts ready: treat a missing component as
         // "0.0, ready to strike" instead of skipping this step.
         let ready = cooldown.is_none_or(|value| value <= 0.0);
@@ -497,7 +507,7 @@ fn attack_system(
         }
 
         let amount = combat.damage_for(kind);
-        if rows.get(&target).is_some_and(|(_, _, _, attacking)| *attacking) {
+        if attacking_rows.contains(&target) {
             // The victim is a fighter: merge its blows and apply them
             // in place through the fighter query below.
             let taken = fighter_damage.entry(target).or_insert(0.0);
@@ -525,11 +535,7 @@ fn attack_system(
     // order this tick is never left marked — which keeps the victim query's
     // disjointness provable to the scheduler on the next tick.
     for &(entity, _, _, owner, target, _, _) in &fighter_snapshot {
-        if !demoted.contains(&entity)
-            && rows.get(&target).is_some_and(|(player, _, health, _)| {
-                *player != owner && *health > 0.0
-            })
-        {
+        if !demoted.contains(&entity) && target_is_valid(&rows, &fighter_rows, target, owner) {
             commands.entity(entity).insert(Attacking);
         }
     }
@@ -557,11 +563,10 @@ fn attack_system(
     // target — because their `Health` cannot be touched through the victim
     // query without aliasing.
     for (victim, amount) in pending_damage {
-        if let Ok(mut health) = victim_health.get_mut(victim) {
+        if let Ok((_, _, _, mut health)) = victims.get_mut(victim) {
             if health.take_damage(amount) {
                 commands.entity(victim).insert(Dead);
             }
-            running_health.insert(victim, health.current);
         }
         // A victim that vanished between the snapshot and now simply takes
         // no blow; `take_damage` clamps at zero so two strikes can never
@@ -574,6 +579,39 @@ fn attack_system(
             }
         }
     }
+}
+
+/// True when `target` names a living enemy unit in either row table: the
+/// pure-victim snapshot or the fighter snapshot (attackers are valid targets
+/// too). Used by `attack_system` both for staleness checks and for keeping
+/// the `Attacking` marker in sync with live orders.
+#[allow(clippy::type_complexity)]
+fn target_is_valid(
+    victim_rows: &HashMap<Entity, (u8, Vec2, f32)>,
+    fighter_rows: &HashMap<Entity, (u8, Vec2, f32)>,
+    target: Entity,
+    owner: u8,
+) -> bool {
+    let row = victim_rows.get(&target).or_else(|| fighter_rows.get(&target));
+    row.is_some_and(|(player, _, health)| *player != owner && *health > 0.0)
+}
+
+/// Distance from `position` to the snapshotted location of `target`, looked
+/// up in the victim rows first and then the fighter rows. Returns infinity
+/// when the target is missing from both tables.
+#[allow(clippy::type_complexity)]
+fn target_distance(
+    victim_rows: &HashMap<Entity, (u8, Vec2, f32)>,
+    fighter_rows: &HashMap<Entity, (u8, Vec2, f32)>,
+    target: Entity,
+    position: Vec2,
+) -> f32 {
+    victim_rows
+        .get(&target)
+        .or_else(|| fighter_rows.get(&target))
+        .map_or(f32::INFINITY, |(_, target_position, _)| {
+            position.distance(*target_position)
+        })
 }
 
 /// Remove units that reached zero health inside the fixed-step simulation,
