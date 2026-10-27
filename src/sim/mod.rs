@@ -7,6 +7,7 @@ use bevy::app::FixedMain;
 use bevy::ecs::world::EntityWorldMut;
 use bevy::prelude::*;
 use bevy::time::TimeUpdateStrategy;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crate::core::{
@@ -370,24 +371,27 @@ fn attack_system(
     time: Res<Time<Fixed>>,
     combat: Res<CombatDefinition>,
     mut commands: Commands,
-    attackers: Query<
+    everyone: Query<(Entity, &Player, &WorldPosition, &Health), With<Unit>>,
+    // Fighters (units holding an attack order) and their cooldown clocks.
+    // This is the only parameter that touches `AttackCooldown`, so cooldown
+    // writes can land directly here without any conflict; the decision pass
+    // below snapshots from it before mutating through the same query.
+    #[allow(clippy::type_complexity)]
+    mut fighters: Query<
         (
             Entity,
             &Unit,
             &WorldPosition,
             &Player,
             &AttackOrder,
-            Option<&AttackCooldown>,
+            Option<&mut AttackCooldown>,
         ),
         With<Unit>,
     >,
-    everyone: Query<(Entity, &Player, &WorldPosition, &Health), With<Unit>>,
-    mut writable: ParamSet<(
-        // Attackers: they always carry both the order and its cooldown clock.
-        Query<&mut AttackCooldown, With<AttackOrder>>,
-        // Everyone else (pure victims): apply damage straight to their HP.
-        Query<&mut Health, Without<AttackOrder>>,
-    )>,
+    // Pure victims — every unit without an attack order. Apply damage
+    // straight to their HP so a second strike inside the same tick sees the
+    // reduced health.
+    mut victim_health: Query<&mut Health, Without<AttackOrder>>,
 ) {
     // The cooldown is a countdown clock, so it must advance by exactly one
     // fixed step per tick. `Time<Fixed>::delta_secs` reports the accumulated
@@ -403,10 +407,29 @@ fn attack_system(
         .iter()
         .map(|(entity, player, position, health)| (entity, player.0, position.0, health.current))
         .collect();
-    let living: Vec<(Entity, u8, Vec2)> = snapshot
+    // Map from entity to its snapshotted row, for O(1) target lookups.
+    let rows: HashMap<Entity, (u8, Vec2, f32)> = snapshot
         .iter()
-        .filter(|(_, _, _, current)| *current > 0.0)
-        .map(|&(entity, player, position, _)| (entity, player, position))
+        .map(|&(entity, player, position, health)| (entity, (player, position, health)))
+        .collect();
+    std::mem::drop(snapshot);
+
+    // Snapshot the fighters (order holders) together with their cooldown
+    // clocks before any mutable query runs; the decision pass below works
+    // purely on this data.
+    #[allow(clippy::type_complexity)]
+    let fighter_snapshot: Vec<(Entity, UnitKind, Vec2, u8, Entity, Option<f32>)> = fighter_orders
+        .iter()
+        .map(|(entity, unit, position, owner, order, cooldown)| {
+            (
+                entity,
+                unit.kind,
+                position.0,
+                owner.0,
+                order.target,
+                cooldown.map(|cooldown| cooldown.0),
+            )
+        })
         .collect();
 
     // Decide every strike for this tick first, then apply them in one pass.
@@ -418,23 +441,24 @@ fn attack_system(
     // mutable fighter query above, so these few writes stay deferred.
     let mut ensure_cooldown: Vec<Entity> = Vec::new();
 
-    for (entity, unit, position, owner, order, cooldown) in &attackers {
+    for &(entity, kind, position, owner, target, cooldown) in &fighter_snapshot {
         // Drop stale orders: the target must still exist, be alive, and not
         // belong to the attacker's own player (no friendly fire).
-        let target_row = living.iter().find(|(id, ..)| *id == order.target);
-        let target_ok = target_row.is_some_and(|(_, player, _)| *player != owner.0);
+        let target_row = rows.get(&target);
+        let target_ok =
+            target_row.is_some_and(|(player, _, health)| *player != owner && *health > 0.0);
         if !target_ok {
             stale_orders.push(entity);
             continue;
         }
 
-        let distance = target_row.map_or(f32::INFINITY, |(_, _, target_position)| {
-            position.0.distance(*target_position)
+        let distance = target_row.map_or(f32::INFINITY, |(_, target_position, _)| {
+            position.distance(*target_position)
         });
         // A freshly assigned order starts ready: treat a missing component as
         // "0.0, ready to strike" instead of skipping this step.
-        let ready = cooldown.is_none_or(|cooldown| cooldown.0 <= 0.0);
-        if distance > combat.range_for(unit.kind) {
+        let ready = cooldown.is_none_or(|value| value <= 0.0);
+        if distance > combat.range_for(kind) {
             if cooldown.is_none() {
                 ensure_cooldown.push(entity);
             }
@@ -442,26 +466,32 @@ fn attack_system(
         }
         if !ready {
             // Still on cooldown: tick it down by exactly one fixed step.
-            let remaining = cooldown.map_or(0.0, |cooldown| (cooldown.0 - dt).max(0.0));
+            let remaining = cooldown.map_or(0.0, |value| (value - dt).max(0.0));
             strike_cooldowns.push((entity, remaining));
             continue;
         }
 
-        pending_damage.push((order.target, combat.damage_for(unit.kind)));
-        strike_cooldowns.push((entity, combat.cooldown_for(unit.kind)));
+        pending_damage.push((target, combat.damage_for(kind)));
+        strike_cooldowns.push((entity, combat.cooldown_for(kind)));
     }
 
-    for entity in stale_orders {
-        commands.entity(entity).remove::<AttackOrder>();
-    }
-    for entity in ensure_cooldown {
-        commands.entity(entity).insert(AttackCooldown(0.0));
-    }
     // Units that hold an attack order always own their cooldown component
     // (every order assignment inserts one), so cooldown writes land directly
-    // on p0; anything unexpected falls back to a deferred insert.
+    // on the fighter query; anything unexpected falls back to a deferred
+    // insert. Fighters whose order was removed this tick (stale targets) take
+    // their cooldown through the same deferred path instead, because applying
+    // structural edits mid-system is unsafe.
+    let demoted: HashSet<Entity> = stale_orders.iter().copied().collect();
+    for entity in &stale_orders {
+        commands.entity(*entity).remove::<AttackOrder>();
+    }
+    for entity in &ensure_cooldown {
+        commands.entity(*entity).insert(AttackCooldown(0.0));
+    }
     for (entity, value) in strike_cooldowns {
-        if let Ok(mut cooldown) = writable.p0().get_mut(entity) {
+        if demoted.contains(&entity) {
+            commands.entity(entity).insert(AttackCooldown(value));
+        } else if let Ok(mut cooldown) = fighter_cooldowns.get_mut(entity) {
             cooldown.0 = value;
         } else {
             commands.entity(entity).insert(AttackCooldown(value));
@@ -470,12 +500,12 @@ fn attack_system(
 
     // Apply the accumulated damage in strike order and mark anyone who
     // reaches zero as dead; `death_system` despawns them. Pure victims are
-    // edited in place via p1, so a second strike inside this same tick sees
-    // the reduced health and no unit can absorb more total damage than it
-    // has HP. Attackers (mutable access lives in p0) take damage through
-    // deferred per-entity commands instead.
+    // edited in place, so a second strike inside this same tick sees the
+    // reduced health and no unit can absorb more total damage than it has HP.
+    // Fighters (mutable access lives in `fighter_cooldowns`) take damage
+    // through deferred per-entity commands instead.
     for (victim, amount) in pending_damage {
-        if let Ok(mut health) = writable.p1().get_mut(victim) {
+        if let Ok(mut health) = victim_health.get_mut(victim) {
             if health.take_damage(amount) {
                 commands.entity(victim).insert(Dead);
             }
