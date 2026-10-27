@@ -242,6 +242,13 @@ pub struct Unit {
     pub kind: UnitKind,
 }
 
+/// Marker for units that currently hold an attack order. `attack_system`
+/// maintains it every tick (adding and removing in the same system), so the
+/// scheduler can prove its disjoint mutable queries never overlap: attackers
+/// carry this marker, pure victims do not.
+#[derive(Component, Debug)]
+pub struct Attacking;
+
 #[derive(Component, Debug)]
 pub struct Selected;
 

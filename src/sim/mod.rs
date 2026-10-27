@@ -13,7 +13,7 @@ use std::time::Duration;
 use crate::core::{
     map::NavigationGrid,
     units::{
-        AttackCooldown, AttackOrder, Building, CombatDefinition, ConstructionSite, Dead,
+        AttackCooldown, AttackOrder, Attacking, Building, CombatDefinition, ConstructionSite, Dead,
         HarvestOrder, Health, MovePath, Player, PlayerCommand, PlayerEconomy, ResourceNode,
         Selected, ShedDefinition, ShedPlacement, Unit, UnitKind, WorldPosition,
     },
@@ -377,9 +377,14 @@ fn attack_system(
     mut commands: Commands,
     everyone: Query<(Entity, &Player, &WorldPosition, &Health), With<Unit>>,
     // Fighters: units holding an attack order, together with their cooldown
-    // clocks. This is the only parameter that touches `AttackCooldown`, so
-    // cooldown writes can land directly here; the decision pass below
-    // snapshots from it before mutating through the same query.
+    // clocks and health. This is the only parameter that touches both
+    // `AttackCooldown` and attacker `Health`, so cooldown writes can land
+    // directly here; the decision pass below snapshots from it before
+    // mutating through the same query. Health must ride along with the
+    // fighter query because the victim query's `Without<AttackOrder>`
+    // complement is not provably disjoint to the scheduler (other systems
+    // insert orders on entities this tick), so any separate mutable `Health`
+    // access would alias — instead fighters are damaged in place here.
     mut fighters: Query<
         (
             Entity,
@@ -388,14 +393,14 @@ fn attack_system(
             &Player,
             &AttackOrder,
             Option<&mut AttackCooldown>,
+            &mut Health,
         ),
         With<Unit>,
     >,
     // Pure victims — every unit without an attack order. Their `Health` is
-    // disjoint from the fighter query above (provable via
-    // `Without<AttackOrder>`), so damage lands in place and a second strike
-    // inside the same tick sees the reduced health. Fighters take damage
-    // through the deferred path described on the system docs instead.
+    // disjoint from the fighter query above (`Without<AttackOrder>`), so
+    // damage lands in place and a second strike inside the same tick sees
+    // the reduced health.
     mut victim_health: Query<&mut Health, (With<Unit>, Without<AttackOrder>)>,
 ) {
     // The cooldown is a countdown clock, so it must advance by exactly one
@@ -496,6 +501,22 @@ fn attack_system(
     let demoted: HashSet<Entity> = stale_orders.iter().copied().collect();
     for entity in &stale_orders {
         commands.entity(*entity).remove::<AttackOrder>();
+    }
+    // Sync the `Attacking` marker with the orders decided above. Removals
+    // apply before insertions during command flushing, so an attacker that
+    // loses its order this tick is never left marked — and the victim query's
+    // disjointness stays provable to the scheduler.
+    for &(entity, _, _, owner, target, _) in &fighter_snapshot {
+        if !demoted.contains(&entity)
+            && rows.get(&target).is_some_and(|(player, _, health)| {
+                *player != owner && *health > 0.0
+            })
+        {
+            commands.entity(entity).insert(Attacking);
+        }
+    }
+    for entity in &demoted {
+        commands.entity(*entity).remove::<Attacking>();
     }
     for entity in &ensure_cooldown {
         commands.entity(*entity).insert(AttackCooldown(0.0));
