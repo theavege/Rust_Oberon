@@ -32,9 +32,9 @@ impl Plugin for SimPlugin {
             // The simulation runs on `FixedMain`, driven at a fixed frequency
             // by the time plugin's catch-up loop. Tests drive the same
             // schedule deterministically with a manual virtual clock.
-            .insert_resource(TimeUpdateStrategy::ManualDuration(
-                Duration::from_secs_f64(SIM_STEP_SECONDS),
-            ))
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
+                SIM_STEP_SECONDS,
+            )))
             .add_systems(
                 FixedMain,
                 (
@@ -178,12 +178,7 @@ fn apply_player_commands(
 /// in the cell the target actually stands. Cells outside the radius are still
 /// usable as fallbacks, ranked by their closest-point distance. When nothing
 /// reachable exists near the target, path straight to the target itself.
-fn approach_path(
-    navigation: &NavigationGrid,
-    start: IVec2,
-    goal: IVec2,
-    range: f32,
-) -> Vec<IVec2> {
+fn approach_path(navigation: &NavigationGrid, start: IVec2, goal: IVec2, range: f32) -> Vec<IVec2> {
     let range_sq = range * range;
     let goal_center = NavigationGrid::cell_center(goal);
 
@@ -206,8 +201,8 @@ fn approach_path(
             let near_x = (dx - 16.0).max(0.0);
             let near_y = (dy - 8.0).max(0.0);
             let near_sq = near_x * near_x + near_y * near_y;
-            let proximity = (start.x - cell.x).unsigned_abs() as f32
-                + (start.y - cell.y).unsigned_abs() as f32;
+            let proximity =
+                (start.x - cell.x).unsigned_abs() as f32 + (start.y - cell.y).unsigned_abs() as f32;
             let score = if far_sq <= range_sq {
                 // In range from anywhere inside this cell: prefer guaranteed
                 // cells (by worst case, then by proximity to the attacker).
@@ -365,18 +360,26 @@ fn movement_system(
 /// target (handled by `movement_system`) and strike whenever the target is in
 /// range and the cooldown has elapsed. Invalid or dead targets are dropped.
 /// The system reads one consistent snapshot per tick, decides every strike up
-/// front, then applies damage directly so a second hit inside the same tick
-/// sees the reduced health. Structural changes go through deferred `Commands`.
+/// front, then applies damage so a second hit inside the same tick sees the
+/// reduced health. Structural changes go through deferred `Commands`.
+///
+/// The two mutable queries are deliberately disjoint (`With`/
+/// `Without<AttackOrder>`) so Bevy's scheduler can prove they never touch the
+/// same entity: attackers own their cooldown clock, pure victims own their
+/// health. A fighter that is attacked takes its damage through a deferred
+/// `EntityCommand::queue`, which runs after the system and therefore cannot
+/// alias the live queries; multiple blows on the same fighter accumulate
+/// inside one queued command instead of overwriting each other.
+#[allow(clippy::type_complexity)]
 fn attack_system(
     time: Res<Time<Fixed>>,
     combat: Res<CombatDefinition>,
     mut commands: Commands,
     everyone: Query<(Entity, &Player, &WorldPosition, &Health), With<Unit>>,
-    // Fighters (units holding an attack order) and their cooldown clocks.
-    // This is the only parameter that touches `AttackCooldown`, so cooldown
-    // writes can land directly here without any conflict; the decision pass
-    // below snapshots from it before mutating through the same query.
-    #[allow(clippy::type_complexity)]
+    // Fighters: units holding an attack order, together with their cooldown
+    // clocks. This is the only parameter that touches `AttackCooldown`, so
+    // cooldown writes can land directly here; the decision pass below
+    // snapshots from it before mutating through the same query.
     mut fighters: Query<
         (
             Entity,
@@ -388,10 +391,12 @@ fn attack_system(
         ),
         With<Unit>,
     >,
-    // Pure victims — every unit without an attack order. Apply damage
-    // straight to their HP so a second strike inside the same tick sees the
-    // reduced health.
-    mut victim_health: Query<&mut Health, Without<AttackOrder>>,
+    // Pure victims — every unit without an attack order. Their `Health` is
+    // disjoint from the fighter query above (provable via
+    // `Without<AttackOrder>`), so damage lands in place and a second strike
+    // inside the same tick sees the reduced health. Fighters take damage
+    // through the deferred path described on the system docs instead.
+    mut victim_health: Query<&mut Health, (With<Unit>, Without<AttackOrder>)>,
 ) {
     // The cooldown is a countdown clock, so it must advance by exactly one
     // fixed step per tick. `Time<Fixed>::delta_secs` reports the accumulated
@@ -413,6 +418,13 @@ fn attack_system(
         .map(|&(entity, player, position, health)| (entity, (player, position, health)))
         .collect();
     std::mem::drop(snapshot);
+    // Track the live HP of every unit through this tick so fighters — whose
+    // mutable access lives on their cooldown, not their health — still see a
+    // second strike inside the same tick observe the reduced value.
+    let mut running_health: HashMap<Entity, f32> = rows
+        .iter()
+        .map(|(&entity, &(_, _, health))| (entity, health))
+        .collect();
 
     // Snapshot the fighters (order holders) together with their cooldown
     // clocks before any mutable query runs; the decision pass below works
@@ -500,24 +512,38 @@ fn attack_system(
 
     // Apply the accumulated damage in strike order and mark anyone who
     // reaches zero as dead; `death_system` despawns them. Pure victims are
-    // edited in place, so a second strike inside this same tick sees the
-    // reduced health and no unit can absorb more total damage than it has HP.
-    // Fighters (mutable access lives only on their cooldown) take damage
-    // through deferred per-entity commands instead.
+    // edited in place through the disjoint victim query, so a second strike
+    // inside this same tick sees the reduced health. Fighters take damage
+    // through a deferred per-entity command (their mutable access lives on
+    // their cooldown); to keep the no-overdamage rule for them too, several
+    // blows landing on the same fighter within one tick are merged into a
+    // single queued command that subtracts the total from live HP.
+    let mut fighter_damage: HashMap<Entity, f32> = HashMap::new();
     for (victim, amount) in pending_damage {
         if let Ok(mut health) = victim_health.get_mut(victim) {
+            running_health.insert(victim, health.current);
             if health.take_damage(amount) {
                 commands.entity(victim).insert(Dead);
             }
+        } else if rows.contains_key(&victim) {
+            *fighter_damage.entry(victim).or_insert(0.0) += amount;
         } else {
-            commands.entity(victim).queue(move |mut world: EntityWorldMut| {
+            // The target despawned between the snapshot and now; drop the blow.
+            continue;
+        }
+    }
+    for (victim, total) in fighter_damage {
+        let start = running_health.get(&victim).copied().unwrap_or(0.0);
+        if start - total <= 0.0 {
+            commands.entity(victim).insert(Dead);
+        }
+        commands
+            .entity(victim)
+            .queue(move |mut world: EntityWorldMut| {
                 if let Some(mut health) = world.get_mut::<Health>() {
-                    if health.take_damage(amount) {
-                        world.insert(Dead);
-                    }
+                    health.take_damage(total);
                 }
             });
-        }
     }
 }
 
@@ -612,9 +638,9 @@ mod tests {
         // fixed ticks (and cooldowns) non-deterministic in tests.
         app.add_plugins(MinimalPlugins)
             .insert_resource(Time::<Virtual>::default())
-            .insert_resource(TimeUpdateStrategy::ManualDuration(
-                Duration::from_secs_f64(SIM_STEP_SECONDS),
-            ))
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
+                SIM_STEP_SECONDS,
+            )))
             .insert_resource(open_grid())
             .insert_resource(combat)
             .init_resource::<PlayerEconomy>()
@@ -737,10 +763,7 @@ mod tests {
         }
 
         fn position(&self, entity: Entity) -> Option<Vec2> {
-            self.app
-                .world()
-                .get::<WorldPosition>(entity)
-                .map(|p| p.0)
+            self.app.world().get::<WorldPosition>(entity).map(|p| p.0)
         }
 
         fn set_position(&mut self, entity: Entity, position: Vec2) {
@@ -995,5 +1018,3 @@ mod tests {
         );
     }
 }
-
-
