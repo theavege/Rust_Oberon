@@ -150,21 +150,32 @@ fn apply_player_commands(
                     if selected.is_none() || !combat.can_attack(unit.kind) {
                         continue;
                     }
-                    commands.entity(entity).insert((
+                    let distance = position.0.distance(target_position.0);
+                    let range = combat.range_for(unit.kind);
+                    let mut entity_commands = commands.entity(entity);
+                    if distance > range {
+                        // Out of reach: queue the approach route and attach the
+                        // order only once the path exists (see below).
+                        let start = navigation.world_to_cell(position.0);
+                        let goal_cell = navigation.world_to_cell(target_position.0);
+                        let path = approach_path(&navigation, start, goal_cell, range);
+                        if path.is_empty() {
+                            // No reachable attack position: do not leave a
+                            // permanent order against a target this unit can
+                            // never strike.
+                            continue;
+                        }
+                        entity_commands.insert(MovePath(path.into()));
+                    } else {
+                        // Already in range: drop any leftover movement route
+                        // so the unit stands its ground and strikes.
+                        entity_commands.remove::<MovePath>();
+                    }
+                    entity_commands.insert((
                         AttackOrder { target },
                         AttackCooldown::default(),
                         Attacking,
                     ));
-                    // Move into range if we are not already there. Approach one
-                    // cell short of the target so units settle adjacent to it.
-                    let distance = position.0.distance(target_position.0);
-                    let range = combat.range_for(unit.kind);
-                    if distance > range {
-                        let start = navigation.world_to_cell(position.0);
-                        let goal_cell = navigation.world_to_cell(target_position.0);
-                        let path = approach_path(&navigation, start, goal_cell, range);
-                        commands.entity(entity).insert(MovePath(path.into()));
-                    }
                 }
             }
         }
@@ -491,7 +502,18 @@ fn attack_system(
         let distance = target_distance(&rows, &fighter_rows, target, position);
         // A freshly assigned order starts ready: treat a missing component as
         // "0.0, ready to strike" instead of skipping this step.
-        let ready = cooldown.is_none_or(|value| value <= 0.0);
+        let remaining = cooldown.unwrap_or(0.0);
+        let ready = remaining <= 0.0;
+        if !ready {
+            // The countdown clock must always advance by exactly one fixed
+            // step per tick — even while still walking toward the target —
+            // or an attacker that arrives out of phase with its cooldown
+            // would wait a full extra cycle before its first strike. Record
+            // the decayed value (deferred writes below tolerate entities
+            // whose order was dropped this tick).
+            let decayed = (remaining - dt).max(0.0);
+            strike_cooldowns.push((entity, decayed));
+        }
         if distance > combat.range_for(kind) {
             if cooldown.is_none() {
                 ensure_cooldown.push(entity);
@@ -499,9 +521,8 @@ fn attack_system(
             continue;
         }
         if !ready {
-            // Still on cooldown: tick it down by exactly one fixed step.
-            let remaining = cooldown.map_or(0.0, |value| (value - dt).max(0.0));
-            strike_cooldowns.push((entity, remaining));
+            // In range but still on cooldown: the decay above already
+            // recorded this tick's clock update.
             continue;
         }
 
@@ -666,17 +687,25 @@ fn opponent_ai_system(
         else {
             continue;
         };
-        commands.entity(entity).insert((
-            AttackOrder { target },
-            AttackCooldown::default(),
-            Attacking,
-        ));
+        let mut entity_commands = commands.entity(entity);
         if position.0.distance(target_position.0) > combat.range_for(unit.kind) {
             let start = navigation.world_to_cell(position.0);
             let goal_cell = navigation.world_to_cell(target_position.0);
             let path = approach_path(&navigation, start, goal_cell, combat.range_for(unit.kind));
-            commands.entity(entity).insert(MovePath(path.into()));
+            if path.is_empty() {
+                // Unreachable: no point holding a permanent order the enemy
+                // can never execute; it will re-evaluate next tick.
+                continue;
+            }
+            entity_commands.insert(MovePath(path.into()));
+        } else {
+            entity_commands.remove::<MovePath>();
         }
+        entity_commands.insert((
+            AttackOrder { target },
+            AttackCooldown::default(),
+            Attacking,
+        ));
     }
 }
 
@@ -903,7 +932,9 @@ mod tests {
     #[test]
     fn attacks_only_land_within_range() {
         let mut test = TestApp::new();
-        // Warrior melee range is 30.0; place the target just outside it.
+        // Warrior melee range is 30.0; place the target just outside it, in a
+        // spot no approach route can reach (see `blocked_grid`), so the unit
+        // cannot walk into range and "no damage" really tests the range rule.
         let attacker = test.spawn_unit(UnitKind::Warrior, 0, Vec2::ZERO, true);
         let target = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 40.0, false);
 
@@ -911,12 +942,13 @@ mod tests {
         test.steps(60); // three full cooldown periods while out of reach
         assert_eq!(test.health(target), Some(100.0), "no damage beyond range");
         assert!(
-            test.has_attack_order(attacker),
-            "order persists while pursuing"
+            !test.has_attack_order(attacker),
+            "an unreachable attack position rejects the order"
         );
 
         // Teleport into range: the next eligible step must deal damage.
         test.set_position(attacker, Vec2::X * 20.0);
+        test.send(PlayerCommand::Attack(target));
         test.steps(2);
         assert_eq!(test.health(target), Some(80.0), "damage once in range");
     }
