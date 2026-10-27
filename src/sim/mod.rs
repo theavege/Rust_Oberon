@@ -155,10 +155,11 @@ fn apply_player_commands(
                     // Move into range if we are not already there. Approach one
                     // cell short of the target so units settle adjacent to it.
                     let distance = position.0.distance(target_position.0);
-                    if distance > combat.range_for(unit.kind) {
+                    let range = combat.range_for(unit.kind);
+                    if distance > range {
                         let start = navigation.world_to_cell(position.0);
                         let goal_cell = navigation.world_to_cell(target_position.0);
-                        let path = approach_path(&navigation, start, goal_cell);
+                        let path = approach_path(&navigation, start, goal_cell, range);
                         commands.entity(entity).insert(MovePath(path.into()));
                     }
                 }
@@ -167,29 +168,63 @@ fn apply_player_commands(
     }
 }
 
-/// Path an attacking unit walks to reach a target standing on `goal`: aim for
-/// the walkable neighbor cell closest to the attacker so it stops adjacent to
-/// (and in range of) the target instead of walking onto its cell.
-fn approach_path(navigation: &NavigationGrid, start: IVec2, goal: IVec2) -> Vec<IVec2> {
-    const NEIGHBORS: [(i32, i32); 8] = [
-        (-1, 0),
-        (1, 0),
-        (0, -1),
-        (0, 1),
-        (-1, -1),
-        (-1, 1),
-        (1, -1),
-        (1, 1),
-    ];
-    let best = NEIGHBORS
-        .iter()
-        .map(|&(dx, dy)| goal + IVec2::new(dx, dy))
-        .filter(|&cell| navigation.is_walkable(cell))
-        .min_by_key(|&cell| (cell.x - start.x).unsigned_abs() + (cell.y - start.y).unsigned_abs());
-    match best.or_else(|| navigation.nearest_walkable(goal)) {
-        Some(cell) => navigation.find_path(start, cell).unwrap_or_default(),
-        None => Vec::new(),
+/// Path an attacking unit walks toward a target standing on `goal`, aiming to
+/// stop within `range` world units of it instead of walking onto its cell.
+/// Walkable cells inside that radius are ranked by their *worst-case* distance
+/// to any point of the target's footprint cell (the cell center plus half the
+/// cell's diagonal extent): if even the far corner is within range, the unit
+/// is guaranteed to be able to strike as soon as it arrives, no matter where
+/// in the cell the target actually stands. Cells outside the radius are still
+/// usable as fallbacks, ranked by their closest-point distance. When nothing
+/// reachable exists near the target, path straight to the target itself.
+fn approach_path(
+    navigation: &NavigationGrid,
+    start: IVec2,
+    goal: IVec2,
+    range: f32,
+) -> Vec<IVec2> {
+    let range_sq = range * range;
+    let goal_center = NavigationGrid::cell_center(goal);
+
+    let mut candidates: Vec<(f32, IVec2)> = Vec::new();
+    for y in (goal.y - 5)..=(goal.y + 5) {
+        for x in (goal.x - 5)..=(goal.x + 5) {
+            let cell = IVec2::new(x, y);
+            if !navigation.is_walkable(cell) {
+                continue;
+            }
+            let center = NavigationGrid::cell_center(cell);
+            let dx = (center.x - goal_center.x).abs();
+            let dy = (center.y - goal_center.y).abs();
+            // Worst-case distance to any point of the target's footprint cell:
+            // the cell-center offset plus the half-extents (16, 8) of one tile.
+            let far_x = dx + 16.0;
+            let far_y = dy + 8.0;
+            let far_sq = far_x * far_x + far_y * far_y;
+            // Closest-approach distance to the footprint rectangle.
+            let near_x = (dx - 16.0).max(0.0);
+            let near_y = (dy - 8.0).max(0.0);
+            let near_sq = near_x * near_x + near_y * near_y;
+            let proximity = (start.x - cell.x).unsigned_abs() as f32
+                + (start.y - cell.y).unsigned_abs() as f32;
+            let score = if far_sq <= range_sq {
+                // In range from anywhere inside this cell: prefer guaranteed
+                // cells (by worst case, then by proximity to the attacker).
+                far_sq + 0.001 * proximity
+            } else {
+                // Fallback cells rank behind every guaranteed cell.
+                range_sq + 1.0 + near_sq + 0.001 * proximity
+            };
+            candidates.push((score, cell));
+        }
     }
+    let destination = candidates
+        .into_iter()
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, cell)| cell)
+        .or_else(|| navigation.nearest_walkable(goal))
+        .unwrap_or(goal);
+    navigation.find_path(start, destination).unwrap_or_default()
 }
 
 fn can_place_shed(
@@ -348,7 +383,12 @@ fn attack_system(
     >,
     everyone: Query<(Entity, &Player, &WorldPosition, &Health), With<Unit>>,
 ) {
-    let dt = time.delta_secs();
+    // The cooldown is a countdown clock, so it must advance by exactly one
+    // fixed step per tick. `Time<Fixed>::delta_secs` reports the accumulated
+    // real-time delta of the whole catch-up loop (and drifts with the wall
+    // clock under the virtual clock in tests), which would make strikes
+    // non-deterministic; the timestep itself is the production cadence.
+    let dt = time.timestep().as_secs_f32();
     // Snapshot every unit up front: a lethal strike inside this same step
     // must not stop another attacker from also landing its blow, and damage
     // application below never mutates state while a query is iterating.
@@ -495,7 +535,7 @@ fn opponent_ai_system(
         if position.0.distance(target_position.0) > combat.range_for(unit.kind) {
             let start = navigation.world_to_cell(position.0);
             let goal_cell = navigation.world_to_cell(target_position.0);
-            let path = approach_path(&navigation, start, goal_cell);
+            let path = approach_path(&navigation, start, goal_cell, combat.range_for(unit.kind));
             commands.entity(entity).insert(MovePath(path.into()));
         }
     }
@@ -522,9 +562,14 @@ mod tests {
     fn combat_test_app(combat: CombatDefinition) -> App {
         let mut app = App::new();
         // `MinimalPlugins` already provides `TimePlugin`, so only the virtual
-        // clock resource is added here.
+        // clock and the manual update strategy are added here. Without a
+        // strategy the virtual clock advances by wall-clock time, which makes
+        // fixed ticks (and cooldowns) non-deterministic in tests.
         app.add_plugins(MinimalPlugins)
             .insert_resource(Time::<Virtual>::default())
+            .insert_resource(TimeUpdateStrategy::ManualDuration(
+                Duration::from_secs_f64(SIM_STEP_SECONDS),
+            ))
             .insert_resource(open_grid())
             .insert_resource(combat)
             .init_resource::<PlayerEconomy>()
@@ -658,6 +703,11 @@ mod tests {
                 .world_mut()
                 .entity_mut(entity)
                 .insert(WorldPosition(position));
+            // A teleported unit may now stand nowhere near its queued route;
+            // drop any stale path so movement does not drag it back.
+            if let Some(mut path) = self.app.world_mut().get_mut::<MovePath>(entity) {
+                path.0.clear();
+            }
         }
 
         fn set_health(&mut self, entity: Entity, current: f32) {
@@ -784,7 +834,7 @@ mod tests {
         let target = test.spawn_unit(UnitKind::Peasant, 1, Vec2::X * 10.0, false);
 
         test.send(PlayerCommand::Attack(target));
-        test.steps(3); // one overridden 40-damage strike kills the 40 HP peasant
+        test.steps(4); // one overridden 40-damage strike kills the 40 HP peasant
         assert!(
             test.health(target).is_none(),
             "a single lethal blow must kill and despawn"
