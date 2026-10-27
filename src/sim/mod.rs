@@ -277,7 +277,7 @@ fn construction_system(
 fn movement_system(
     time: Res<Time<Fixed>>,
     navigation: Res<NavigationGrid>,
-    mut q: Query<(&mut WorldPosition, &Unit, &mut MovePath), With<Player>>,
+    mut q: Query<(&mut WorldPosition, &Unit, &mut MovePath), With<Unit>>,
 ) {
     let dt = time.delta_secs();
     for (mut position, unit, mut path) in q.iter_mut() {
@@ -315,92 +315,111 @@ fn movement_system(
 /// Fixed-step combat resolution: units with an `AttackOrder` move toward their
 /// target (handled by `movement_system`) and strike whenever the target is in
 /// range and the cooldown has elapsed. Invalid or dead targets are dropped.
-#[allow(clippy::type_complexity)]
+/// All state changes go through deferred `Commands`, so this system reads one
+/// consistent snapshot per tick and never conflicts with itself mid-iteration.
 fn attack_system(
     time: Res<Time<Fixed>>,
     combat: Res<CombatDefinition>,
     mut commands: Commands,
-    mut attackers: Query<
+    attackers: Query<
         (
             Entity,
             &Unit,
             &WorldPosition,
+            &Player,
             &AttackOrder,
-            Option<&mut AttackCooldown>,
+            Option<&AttackCooldown>,
             Option<&Health>,
         ),
         With<Unit>,
     >,
-    targets: Query<(Entity, &Player, &WorldPosition, &Health), With<Unit>>,
-    mut victims: Query<&mut Health, With<Unit>>,
+    everyone: Query<(Entity, &Player, &WorldPosition, &Health), With<Unit>>,
 ) {
     let dt = time.delta_secs();
     // Snapshot every unit up front: a lethal strike inside this same step
-    // must not stop another attacker from also landing its blow, and we never
-    // mutate target health while iterating the query.
+    // must not stop another attacker from also landing its blow, and damage
+    // application below never mutates state while a query is iterating.
     #[allow(clippy::type_complexity)]
-    let units_snapshot: Vec<(Entity, u8, Vec2, f32)> = targets
+    let snapshot: Vec<(Entity, u8, Vec2, f32)> = everyone
         .iter()
         .map(|(entity, player, position, health)| (entity, player.0, position.0, health.current))
         .collect();
-    let living: Vec<(Entity, u8, Vec2)> = units_snapshot
+    let living: Vec<(Entity, u8, Vec2)> = snapshot
         .iter()
         .filter(|(_, _, _, current)| *current > 0.0)
         .map(|&(entity, player, position, _)| (entity, player, position))
         .collect();
 
-    for (entity, unit, position, order, mut cooldown, attacker_health) in &mut attackers {
+    // Accumulate damage per victim for this tick, then apply it in one pass.
+    // Later strikes see the reduced health of earlier ones (damage is applied
+    // in order), so a unit cannot absorb more total damage than it has HP.
+    let mut current_health: Vec<(Entity, f32)> = snapshot
+        .iter()
+        .map(|&(entity, _, _, health)| (entity, health))
+        .collect();
+    let mut pending_damage: Vec<(Entity, f32)> = Vec::new();
+
+    for (entity, unit, position, owner, order, cooldown, attacker_health) in &attackers {
         // A dead attacker no longer fights; death_system despawns it anyway.
         if attacker_health.is_some_and(|health| health.current <= 0.0) {
             continue;
         }
-        // The attacker's own snapshot row gives its player id without needing
-        // an extra query against the live world.
-        let owner = units_snapshot
-            .iter()
-            .find(|(id, ..)| *id == entity)
-            .map(|&(_, player, _, _)| player);
         // Drop stale orders: the target must still exist, be alive, and not
         // belong to the attacker's own player (no friendly fire).
-        let target_ok = living
-            .iter()
-            .any(|(id, player, _)| *id == order.target && Some(*player) != owner);
+        let target_row = living.iter().find(|(id, ..)| *id == order.target);
+        let target_ok = target_row.is_some_and(|(_, player, _)| *player != owner.0);
         if !target_ok {
             commands.entity(entity).remove::<AttackOrder>();
             continue;
         }
 
-        // Ensure the cooldown component exists (ready to strike) even while
-        // still out of range, so no update-command conflict builds up across
-        // steps and the first eligible step in range always lands a hit.
-        let distance = living
-            .iter()
-            .find(|(id, ..)| *id == order.target)
-            .map_or(f32::INFINITY, |(_, _, target_position)| {
-                position.0.distance(*target_position)
-            });
-        let Some(mut cooldown) = cooldown else {
-            commands.entity(entity).insert(AttackCooldown(0.0));
-            continue;
-        };
+        // Ensure the cooldown component exists even while still out of range,
+        // so the first eligible step in range always lands a hit immediately.
+        let distance = target_row.map_or(f32::INFINITY, |(_, _, target_position)| {
+            position.0.distance(*target_position)
+        });
+        // A freshly assigned order starts ready: treat a missing component as
+        // "0.0, ready to strike" instead of skipping this step.
+        let ready = cooldown.is_none_or(|cooldown| cooldown.0 <= 0.0);
         if distance > combat.range_for(unit.kind) {
+            if cooldown.is_none() {
+                commands.entity(entity).insert(AttackCooldown(0.0));
+            }
             continue;
         }
-        if cooldown.0 > 0.0 {
-            cooldown.0 = (cooldown.0 - dt).max(0.0);
+        if !ready {
+            // Still on cooldown: tick it down (deferred write keeps the whole
+            // system free of conflicting borrows).
+            let remaining = cooldown.map_or(0.0, |cooldown| (cooldown.0 - dt).max(0.0));
+            commands.entity(entity).insert(AttackCooldown(remaining));
             continue;
         }
 
-        let damage = combat.damage_for(unit.kind);
-        // `victims` is a separate query from the read-only snapshot above, so
-        // writes here never conflict with iteration state. Overkill clamps at
-        // zero inside `Health::take_damage`.
-        if let Ok(mut health) = victims.get_mut(order.target) {
-            if health.take_damage(damage) {
-                commands.entity(order.target).insert(Dead);
+        pending_damage.push((order.target, combat.damage_for(unit.kind)));
+        commands
+            .entity(entity)
+            .insert(AttackCooldown(combat.cooldown_for(unit.kind)));
+    }
+
+    // Apply the accumulated damage in strike order and mark anyone who
+    // reaches zero as dead; `death_system` despawns them.
+    for (victim, amount) in pending_damage {
+        let kills = match current_health.iter_mut().find(|(id, _)| *id == victim) {
+            Some((_, health)) => {
+                *health -= amount;
+                *health <= 0.0
             }
+            None => false,
+        };
+        if kills {
+            commands.entity(victim).insert(Dead);
+        } else {
+            commands.entity(victim).queue(move |mut world: EntityWorldMut| {
+                if let Some(mut health) = world.get_mut::<Health>() {
+                    health.take_damage(amount);
+                }
+            });
         }
-        cooldown.0 = combat.cooldown_for(unit.kind);
     }
 }
 
@@ -476,26 +495,24 @@ mod tests {
     use bevy::time::Virtual;
     use std::time::Duration;
 
-    /// Fixed timestep used by all combat tests: 1/20 s per step.
+    /// Nominal fixed-timestep duration in seconds. The virtual clock is
+    /// advanced by exactly this amount per `step()`, so every call runs one
+    /// full production `FixedUpdate` tick — fully deterministic.
     const DT: f32 = 0.05;
-    /// Bevy's default `Real` clock update period; the speed multiplier below
-    /// makes every `app.update()` advance exactly one fixed tick of `DT`.
-    const UPDATE_PERIOD: Duration = Duration::from_micros(2000);
 
     /// Small walkable open area so units can path and approach targets.
     const TEST_MAP: u32 = 64;
 
-    /// Build a bare Bevy app that runs exactly the production `FixedUpdate`
-    /// schedule (same systems, same ordering) without any rendering, window
-    /// or real clock. Time is virtual, so each `step()` advances the sim by
-    /// precisely one fixed tick — fully deterministic.
+    /// Build a bare Bevy app that runs exactly the production schedules
+    /// (same systems, same ordering) without any rendering, window or real
+    /// clock. Time uses a virtual clock, so each `step()` below advances the
+    /// simulation by precisely one fixed tick of `DT` seconds.
     fn combat_test_app(combat: CombatDefinition) -> App {
         let mut app = App::new();
         // `MinimalPlugins` already provides `TimePlugin`, so only the virtual
         // clock resource is added here.
         app.add_plugins(MinimalPlugins)
             .insert_resource(Time::<Virtual>::default())
-
             .insert_resource(open_grid())
             .insert_resource(combat)
             .init_resource::<PlayerEconomy>()
@@ -517,17 +534,8 @@ mod tests {
                     death_system.after(attack_system),
                 ),
             );
-        // Advance the virtual clock by exactly one fixed tick per `step()`.
-        let multiplier = UPDATE_PERIOD.as_secs_f64() / DT as f64;
-        app.world_mut()
-            .resource_mut::<Time<Virtual>>()
-            .set_relative_speed(multiplier as f32);
-        // `TimePlugin` defers event flushing until a fixed tick actually runs
-        // (so `FixedUpdate` systems can see events). With the default 0.99 s
-        // timestep, no tick would ever be due in these short tests and events
-        // would vanish unconsumed. Use a `DT` timestep instead: every virtual
-        // advance of `UPDATE_PERIOD` then executes exactly one fixed step and
-        // flushes events — deterministic one-to-one steps.
+        // Run at exactly the nominal timestep so no accumulator drift builds
+        // up between steps.
         app.world_mut()
             .resource_mut::<Time<Fixed>>()
             .set_timestep_seconds(DT as f64);
@@ -544,18 +552,27 @@ mod tests {
 
     impl TestApp {
         fn new() -> Self {
-            TestApp {
-                app: combat_test_app(CombatDefinition::default()),
-            }
+            Self::with_combat(CombatDefinition::default())
         }
 
         fn with_combat(combat: CombatDefinition) -> Self {
-            TestApp {
-                app: combat_test_app(combat),
-            }
+            let mut app = combat_test_app(combat);
+            // Prime the fixed timestep so the first `step()` below behaves
+            // exactly like every later one (one event flush + one sim tick).
+            app.update();
+            app.world_mut()
+                .resource_mut::<Time<Virtual>>()
+                .advance_by(Duration::from_secs_f32(DT));
+            TestApp { app }
         }
 
-        fn spawn_unit(&mut self, kind: UnitKind, owner: u8, position: Vec2, selected: bool) -> Entity {
+        fn spawn_unit(
+            &mut self,
+            kind: UnitKind,
+            owner: u8,
+            position: Vec2,
+            selected: bool,
+        ) -> Entity {
             let entity = self
                 .app
                 .world_mut()
@@ -581,8 +598,17 @@ mod tests {
         }
 
         /// Advance the simulation by exactly one fixed step of `DT` seconds.
+        /// Bevy's virtual clock advances at the END of `app.update()`, so the
+        /// tick due from the PREVIOUS advance runs during the first call here:
+        /// pending events flush through `apply_player_commands` on `Update`
+        /// before the production fixed-step systems run against that state.
+        /// The second advance arms exactly one more tick for the next `step()`.
         fn step(&mut self) {
             self.app.update();
+            self.app
+                .world_mut()
+                .resource_mut::<Time<Virtual>>()
+                .advance_by(Duration::from_secs_f32(DT));
         }
 
         fn steps(&mut self, count: usize) {
@@ -621,7 +647,10 @@ mod tests {
         }
 
         fn set_position(&mut self, entity: Entity, position: Vec2) {
-            self.app.world_mut().entity_mut(entity).insert(WorldPosition(position));
+            self.app
+                .world_mut()
+                .entity_mut(entity)
+                .insert(WorldPosition(position));
         }
 
         fn set_health(&mut self, entity: Entity, current: f32) {
@@ -864,3 +893,5 @@ mod tests {
         );
     }
 }
+
+
