@@ -3,6 +3,7 @@
 
 pub mod setup;
 
+use bevy::ecs::schedule::EntityWorldMut;
 use bevy::prelude::*;
 
 use crate::core::{
@@ -14,6 +15,9 @@ use crate::core::{
     },
 };
 
+/// Nominal fixed timestep of the simulation, in seconds (20 Hz).
+pub const SIM_STEP_SECONDS: f64 = 0.05;
+
 pub struct SimPlugin;
 
 impl Plugin for SimPlugin {
@@ -21,8 +25,14 @@ impl Plugin for SimPlugin {
         app.add_systems(Startup, setup::spawn_initial_units)
             .add_event::<PlayerCommand>()
             .add_systems(Update, (apply_player_commands, update_shed_placement))
+            // The simulation runs on `FixedMain`, driven at a fixed frequency
+            // by the time plugin's catch-up loop. Tests drive the same
+            // schedule deterministically with a virtual clock.
+            .insert_resource(TimeUpdateStrategy::ManualDuration(
+                Duration::from_secs_f64(SIM_STEP_SECONDS),
+            ))
             .add_systems(
-                FixedUpdate,
+                FixedMain,
                 (
                     opponent_ai_system,
                     movement_system.after(opponent_ai_system),
@@ -405,8 +415,11 @@ fn attack_system(
         if kills {
             commands.entity(victim).insert(Dead);
         } else {
-            commands.entity(victim).queue(move |world: &mut World| {
-                if let Some(mut health) = world.get_mut::<Health>(victim) {
+            // `queue` runs as an `EntityCommand` when the buffered commands
+            // are applied, so this mutation never conflicts with the queries
+            // above (both are already dropped at this point).
+            commands.entity(victim).queue(move |mut victim_entity: EntityWorldMut| {
+                if let Some(mut health) = victim_entity.get_mut::<Health>() {
                     health.take_damage(amount);
                 }
             });
@@ -488,16 +501,16 @@ mod tests {
 
     /// Nominal fixed-timestep duration in seconds. The virtual clock is
     /// advanced by exactly this amount per `step()`, so every call runs one
-    /// full production `FixedUpdate` tick — fully deterministic.
+    /// full production `FixedMain` tick — fully deterministic.
     const DT: f32 = 0.05;
 
     /// Small walkable open area so units can path and approach targets.
     const TEST_MAP: u32 = 64;
 
-    /// Build a bare Bevy app that runs exactly the production schedules
-    /// (same systems, same ordering) without any rendering, window or real
-    /// clock. Time uses a virtual clock, so each `step()` below advances the
-    /// simulation by precisely one fixed tick of `DT` seconds.
+    /// Build a bare Bevy app that runs exactly the production simulation
+    /// systems (same set, same ordering) without any rendering, window or
+    /// real clock. Time uses a virtual clock, so each `step()` below advances
+    /// the simulation by precisely one fixed tick of `DT` seconds.
     fn combat_test_app(combat: CombatDefinition) -> App {
         let mut app = App::new();
         // `MinimalPlugins` already provides `TimePlugin`, so only the virtual
@@ -513,18 +526,18 @@ mod tests {
             // Player commands are applied on `Update` in the real game; tests
             // drive the same schedule so `send(...)` + `step()` behaves like
             // production (commands flush before the fixed combat step runs).
-            .add_systems(Update, apply_player_commands)
-            .add_systems(
-                FixedUpdate,
-                (
-                    opponent_ai_system,
-                    movement_system.after(opponent_ai_system),
-                    harvest_system.after(movement_system),
-                    construction_system.after(harvest_system),
-                    attack_system.after(construction_system),
-                    death_system.after(attack_system),
-                ),
-            );
+            .add_systems(Update, apply_player_commands);
+        app.add_systems(
+            FixedMain,
+            (
+                opponent_ai_system,
+                movement_system.after(opponent_ai_system),
+                harvest_system.after(movement_system),
+                construction_system.after(harvest_system),
+                attack_system.after(construction_system),
+                death_system.after(attack_system),
+            ),
+        );
         // Run at exactly the nominal timestep so no accumulator drift builds
         // up between steps.
         app.world_mut()
@@ -548,12 +561,9 @@ mod tests {
 
         fn with_combat(combat: CombatDefinition) -> Self {
             let mut app = combat_test_app(combat);
-            // Prime the fixed timestep so the first `step()` below behaves
-            // exactly like every later one (one event flush + one sim tick).
+            // Prime startup/default schedules so the first `step()` below
+            // behaves exactly like every later one.
             app.update();
-            app.world_mut()
-                .resource_mut::<Time<Virtual>>()
-                .advance_by(Duration::from_secs_f32(DT));
             TestApp { app }
         }
 
@@ -589,24 +599,17 @@ mod tests {
         }
 
         /// Advance the simulation by exactly one fixed step of `DT` seconds:
-        /// advance the virtual clock by one timestep (which makes exactly one
-        /// `FixedUpdate` tick due), run `app.update()` (flushing events and
-        /// running `Update` systems first, then the fixed systems), and drop
-        /// any sub-nanosecond overstep remainder so float rounding can never
-        /// make a step skip or double-tick.
+        /// advance the virtual clock by one timestep, then run one iteration
+        /// of the production `FixedMain` schedule (movement, harvesting,
+        /// construction, attacks and death, in the same order as the game).
+        /// Commands sent via `send()` take effect on the next call, mirroring
+        /// how `Update` applies player events between fixed ticks.
         fn step(&mut self) {
-            // `update()` runs FixedUpdate first (with the delta accumulated by
-            // the PREVIOUS advance), then Update systems, and finally advances
-            // the virtual clock by `DT`, making exactly one tick due for the
-            // next `update()`. So: first `update()` flushes any pending events
-            // through `apply_player_commands`; second `update()` runs the
-            // production fixed-step systems against that state.
-            self.app.update();
             self.app
                 .world_mut()
                 .resource_mut::<Time<Virtual>>()
                 .advance_by(Duration::from_secs_f32(DT));
-            self.app.update();
+            self.app.world_mut().run_schedule(FixedMain.intern());
         }
 
         fn steps(&mut self, count: usize) {
