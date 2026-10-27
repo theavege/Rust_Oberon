@@ -85,6 +85,7 @@ fn apply_player_commands(
                             .entity(entity)
                             .remove::<HarvestOrder>()
                             .remove::<AttackOrder>()
+                            .remove::<Attacking>()
                             .insert(MovePath(path.into()));
                     }
                 }
@@ -150,9 +151,11 @@ fn apply_player_commands(
                     if selected.is_none() || !combat.can_attack(unit.kind) {
                         continue;
                     }
-                    commands
-                        .entity(entity)
-                        .insert((AttackOrder { target }, AttackCooldown::default()));
+                    commands.entity(entity).insert((
+                        AttackOrder { target },
+                        AttackCooldown::default(),
+                        Attacking,
+                    ));
                     // Move into range if we are not already there. Approach one
                     // cell short of the target so units settle adjacent to it.
                     let distance = position.0.distance(target_position.0);
@@ -363,28 +366,22 @@ fn movement_system(
 /// front, then applies damage so a second hit inside the same tick sees the
 /// reduced health. Structural changes go through deferred `Commands`.
 ///
-/// The two mutable queries are deliberately disjoint (`With`/
-/// `Without<AttackOrder>`) so Bevy's scheduler can prove they never touch the
-/// same entity: attackers own their cooldown clock, pure victims own their
-/// health. A fighter that is attacked takes its damage through a deferred
-/// `EntityCommand::queue`, which runs after the system and therefore cannot
-/// alias the live queries; multiple blows on the same fighter accumulate
-/// inside one queued command instead of overwriting each other.
+/// The two mutable queries are deliberately disjoint so Bevy's scheduler can
+/// prove they never touch the same entity: fighters are exactly the units
+/// carrying the `Attacking` marker — an invariant every order assignment
+/// maintains by inserting the marker together with the order — and pure
+/// victims are everything else (`Without<Attacking>`). A freshly ordered
+/// attacker is already marked, so it strikes on the very next fixed step.
 #[allow(clippy::type_complexity)]
 fn attack_system(
     time: Res<Time<Fixed>>,
     combat: Res<CombatDefinition>,
     mut commands: Commands,
-    everyone: Query<(Entity, &Player, &WorldPosition, &Health), With<Unit>>,
     // Fighters — units marked `Attacking` — together with their cooldown
-    // clocks and health. This is the only parameter that touches both
-    // `AttackCooldown` and attacker `Health`, so cooldown writes can land
-    // directly here; the decision pass below snapshots from it before
-    // mutating through the same query. Health must ride along with the
-    // fighter query because the victim query's `Without<Attacking>`
-    // complement is not provably disjoint to the scheduler (other systems
-    // insert orders on entities this tick), so any separate mutable `Health`
-    // access would alias — instead fighters are damaged in place here.
+    // clocks and health. Cooldown and attacker-health writes land directly
+    // here; the decision pass snapshots from this query before mutating
+    // through it, so a fighter struck by several enemies accumulates one
+    // merged in-place write per target.
     mut fighters: Query<
         (
             Entity,
@@ -397,14 +394,15 @@ fn attack_system(
         ),
         (With<Unit>, With<Attacking>),
     >,
-    // Read-only view of which units currently carry the `Attacking` marker,
-    // used to classify snapshot rows as fighter or pure victim.
-    attacking: Query<Entity, With<Attacking>>,
     // Pure victims — every unit not marked as attacking this tick. Their
     // `Health` is disjoint from the fighter query above
     // (`Without<Attacking>`), so damage lands in place and a second strike
-    // inside the same tick sees the reduced health.
-    mut victim_health: Query<&mut Health, (With<Unit>, Without<Attacking>)>,
+    // inside the same tick sees the reduced health. Victims are read-only
+    // here; their snapshot rows come from this same query.
+    mut victims: Query<
+        (Entity, &Player, &WorldPosition, &Health),
+        (With<Unit>, Without<Attacking>),
+    >,
 ) {
     // The cooldown is a countdown clock, so it must advance by exactly one
     // fixed step per tick. `Time<Fixed>::delta_secs` reports the accumulated
@@ -415,56 +413,29 @@ fn attack_system(
     // Snapshot every unit up front: a lethal strike inside this same step
     // must not stop another attacker from also landing its blow, and the
     // damage pass below never re-reads state while a query is iterating.
-    // Each row records whether the unit is *attacking* (fighter) so damage
-    // can be routed to the right mutable query without aliasing.
-    let attacking_set: HashSet<Entity> = attacking.iter().collect();
+    // Victims (units without the `Attacking` marker) come from the read-only
+    // side of the split; fighters snapshot their own rows further below.
     #[allow(clippy::type_complexity)]
-    let snapshot: Vec<(Entity, u8, Vec2, f32, bool)> = everyone
-        .iter()
-        .map(|(entity, player, position, health)| {
-            (
-                entity,
-                player.0,
-                position.0,
-                health.current,
-                attacking_set.contains(&entity),
-            )
-        })
-        .collect();
-    std::mem::drop(attacking_set);
+    let mut snapshot: Vec<(Entity, u8, Vec2, f32)> = Vec::new();
+    for (entity, player, position, health) in victims.iter() {
+        snapshot.push((entity, player.0, position.0, health.current));
+    }
     // Map from entity to its snapshotted row, for O(1) target lookups. The
     // health column freezes the HP seen at the top of the tick; later
-    // in-place writes are tracked separately (`running_health`, merged
-    // fighter damage), so staleness checks use this value only to decide
-    // whether an order started the tick against a living enemy.
+    // in-place writes are tracked through `victim_health`, so staleness
+    // checks use this value only to decide whether an order started the
+    // tick against a living enemy.
     #[allow(clippy::type_complexity)]
-    let rows: HashMap<Entity, (u8, Vec2, f32, bool)> = snapshot
+    let rows: HashMap<Entity, (u8, Vec2, f32)> = snapshot
         .iter()
-        .map(
-            |&(entity, player, position, health, attacking)| {
-                (entity, (player, position, health, attacking))
-            },
-        )
+        .map(|&(entity, player, position, health)| (entity, (player, position, health)))
         .collect();
     std::mem::drop(snapshot);
-    // Track the live HP of every *victim* through this tick so a second
-    // strike inside the same step observes the reduced value. Fighters are
-    // deliberately absent here: their mutable access lives on the fighter
-    // query, and the decision pass snapshots their health directly, so the
-    // no-overdamage rule for them is enforced there instead.
-    let mut running_health: HashMap<Entity, f32> = rows
-        .iter()
-        .filter(|&(_, &(_, _, _, attacking))| !attacking)
-        .map(|(&entity, &(_, _, health, _))| (entity, health))
-        .collect();
 
     // Snapshot the fighters (units marked `Attacking`) together with their
-    // live health and cooldown clocks before any mutable query runs; the
-    // decision pass below works purely on this data. Health rides along
-    // because the victim query's `Without<Attacking>` complement is not
-    // provably disjoint to the scheduler (orders are inserted elsewhere in
-    // the same tick), so a separate mutable `Health` access would alias —
-    // instead fighters are damaged in place through this query.
+    // live health and cooldown clocks before any mutable pass runs; the
+    // decision loop below works purely on this data, and every write goes
+    // back through the fighter query afterwards.
     #[allow(clippy::type_complexity)]
     let fighter_snapshot: Vec<(Entity, UnitKind, Vec2, u8, Entity, f32, Option<f32>)> = fighters
         .iter()
@@ -658,9 +629,11 @@ fn opponent_ai_system(
         else {
             continue;
         };
-        commands
-            .entity(entity)
-            .insert((AttackOrder { target }, AttackCooldown::default()));
+        commands.entity(entity).insert((
+            AttackOrder { target },
+            AttackCooldown::default(),
+            Attacking,
+        ));
         if position.0.distance(target_position.0) > combat.range_for(unit.kind) {
             let start = navigation.world_to_cell(position.0);
             let goal_cell = navigation.world_to_cell(target_position.0);
