@@ -367,20 +367,20 @@ fn movement_system(
 ///
 /// The two mutable queries are deliberately disjoint so Bevy's scheduler can
 /// prove they never touch the same entity: fighters are exactly the units
-/// carrying the `Attacking` marker — an invariant every order assignment
-/// maintains by inserting the marker together with the order — and pure
-/// victims are everything else (`Without<Attacking>`). A freshly ordered
-/// attacker is already marked, so it strikes on the very next fixed step.
+/// holding an `AttackOrder`, and pure victims are everything else
+/// (`Without<AttackOrder>`). A freshly ordered attacker appears in the
+/// fighter query on the very next fixed step, because orders flush into the
+/// world at the end of the current tick.
 #[allow(clippy::type_complexity)]
 fn attack_system(
     time: Res<Time<Fixed>>,
     combat: Res<CombatDefinition>,
     mut commands: Commands,
-    // Fighters — units marked `Attacking` — together with their cooldown
-    // clocks and health. Cooldown and attacker-health writes land directly
-    // here; the decision pass snapshots from this query before mutating
-    // through it, so a fighter struck by several enemies accumulates one
-    // merged in-place write per target.
+    // Fighters — units holding an `AttackOrder` — together with their
+    // cooldown clocks and health. Cooldown and attacker-health writes land
+    // directly here; the decision pass snapshots from this query before
+    // mutating through it, so a fighter struck by several enemies
+    // accumulates one merged in-place write per target.
     mut fighters: Query<
         (
             Entity,
@@ -391,15 +391,14 @@ fn attack_system(
             Option<&mut AttackCooldown>,
             &mut Health,
         ),
-        (With<Unit>, With<Attacking>),
+        (With<Unit>, With<AttackOrder>),
     >,
     // Pure victims — every unit not holding an attack order this tick. The
-    // fighter query filters `With<Attacking>` and the invariant "every
-    // AttackOrder implies the Attacking marker" (maintained by all order
-    // assignments) means no entity appears in both queries, so the scheduler
-    // can prove their `Health` access disjoint even though both mutate it:
-    // damage lands in place and a second strike inside the same tick sees
-    // the reduced health.
+    // fighter query filters `With<AttackOrder>` and this one filters
+    // `Without<AttackOrder>`, so no entity can appear in both queries and
+    // the scheduler can prove their `Health` access disjoint even though
+    // both mutate it: damage lands in place and a second strike inside the
+    // same tick sees the reduced health.
     #[allow(clippy::type_complexity)]
     mut victims: Query<
         (Entity, &Player, &WorldPosition, &mut Health),
@@ -415,7 +414,7 @@ fn attack_system(
     // Snapshot every unit up front: a lethal strike inside this same step
     // must not stop another attacker from also landing its blow, and the
     // damage pass below never re-reads state while a query is iterating.
-    // Victims (units without the `Attacking` marker) come from the read-only
+    // Victims (units without an attack order) come from the read-only
     // side of the split; fighters snapshot their own rows further below.
     #[allow(clippy::type_complexity)]
     let mut snapshot: Vec<(Entity, u8, Vec2, f32)> = Vec::new();
@@ -434,8 +433,8 @@ fn attack_system(
         .collect();
     std::mem::drop(snapshot);
 
-    // Snapshot the fighters (units marked `Attacking`) together with their
-    // live health and cooldown clocks before any mutable pass runs; the
+    // Snapshot the fighters (units holding an `AttackOrder`) together with
+    // their live health and cooldown clocks before any mutable pass runs; the
     // decision loop below works purely on this data, and every write goes
     // back through the fighter query afterwards. Fighters are also valid
     // attack targets, so keep lookup tables for their rows as well — the
@@ -719,12 +718,15 @@ mod tests {
             // Player commands are applied on `Update` in the real game; tests
             // drive the same schedule so `send(...)` + `step()` behaves like
             // production (commands flush before the fixed combat step runs).
-            .add_systems(Update, apply_player_commands)
+            // The opponent AI is scheduled alongside them here as well: both
+            // issue attack orders through deferred `Commands`, and running the
+            // AI one schedule later would make enemy strikes land a full tick
+            // after player strikes issued at the same moment.
+            .add_systems(Update, (apply_player_commands, opponent_ai_system))
             .add_systems(
                 FixedMain,
                 (
-                    opponent_ai_system,
-                    movement_system.after(opponent_ai_system),
+                    movement_system,
                     harvest_system.after(movement_system),
                     construction_system.after(harvest_system),
                     attack_system.after(construction_system),
@@ -885,7 +887,9 @@ mod tests {
         assert_eq!(test.health(target), Some(40.0 - 20.0));
         assert!(test.alive_count() == 2, "one hit does not kill");
 
-        test.steps(20); // hit two brings the 40 HP peasant to zero.
+        // The peasant is at 20 HP: it takes until the third strike (roughly
+        // two full cooldowns after the first) to reach zero and despawn.
+        test.steps(60);
         assert!(
             test.health(target).is_none(),
             "dead units are removed by the fixed-step sim"
