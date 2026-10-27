@@ -21,6 +21,14 @@ use crate::core::{
 /// Nominal fixed timestep of the simulation, in seconds (20 Hz).
 pub const SIM_STEP_SECONDS: f64 = 0.05;
 
+/// Cached nominal fixed timestep (in seconds) as a resource, so fixed-step
+/// systems can advance countdown clocks by exactly one step per tick. Bevy
+/// only exposes `Time<Fixed>`'s timestep through `State<Time<Fixed>>` (a
+/// `Ref`, not a system parameter), and `delta_secs` accumulates the whole
+/// catch-up loop — neither is usable for per-tick cooldown math.
+#[derive(Resource)]
+pub struct SimTimestep(pub f32);
+
 pub struct SimPlugin;
 
 impl Plugin for SimPlugin {
@@ -34,6 +42,7 @@ impl Plugin for SimPlugin {
             .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
                 SIM_STEP_SECONDS,
             )))
+            .insert_resource(SimTimestep(SIM_STEP_SECONDS as f32))
             .add_systems(
                 FixedMain,
                 (
@@ -384,7 +393,7 @@ fn movement_system(
 /// world at the end of the current tick.
 #[allow(clippy::type_complexity)]
 fn attack_system(
-    time: Res<Time<Fixed>>,
+    timestep: Res<SimTimestep>,
     combat: Res<CombatDefinition>,
     mut commands: Commands,
     // Fighters — units holding an `AttackOrder` — together with their
@@ -420,8 +429,11 @@ fn attack_system(
     // fixed step per tick. `Time<Fixed>::delta_secs` reports the accumulated
     // real-time delta of the whole catch-up loop (and drifts with the wall
     // clock under the virtual clock in tests), which would make strikes
-    // non-deterministic; the timestep itself is the production cadence.
-    let dt = time.timestep().as_secs_f32();
+    // non-deterministic; the nominal timestep is the production cadence.
+    // `Time<Fixed>` only exposes the timestep through `State<Time<Fixed>>`
+    // (a `Ref`, not a system param), so read it once and cache it as a
+    // resource; `SimPlugin::build` inserts the same constant up front.
+    let dt = timestep.get();
     // Snapshot every unit up front: a lethal strike inside this same step
     // must not stop another attacker from also landing its blow, and the
     // damage pass below never re-reads state while a query is iterating.
@@ -738,6 +750,7 @@ mod tests {
             .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
                 SIM_STEP_SECONDS,
             )))
+            .insert_resource(SimTimestep(SIM_STEP_SECONDS as f32))
             .insert_resource(open_grid())
             .insert_resource(combat)
             .init_resource::<PlayerEconomy>()
