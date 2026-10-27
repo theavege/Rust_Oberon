@@ -418,7 +418,7 @@ fn attack_system(
     // clocks before any mutable query runs; the decision pass below works
     // purely on this data.
     #[allow(clippy::type_complexity)]
-    let fighter_snapshot: Vec<(Entity, UnitKind, Vec2, u8, Entity, Option<f32>)> = fighter_orders
+    let fighter_snapshot: Vec<(Entity, UnitKind, Vec2, u8, Entity, Option<f32>)> = fighters
         .iter()
         .map(|(entity, unit, position, owner, order, cooldown)| {
             (
@@ -491,7 +491,7 @@ fn attack_system(
     for (entity, value) in strike_cooldowns {
         if demoted.contains(&entity) {
             commands.entity(entity).insert(AttackCooldown(value));
-        } else if let Ok(mut cooldown) = fighter_cooldowns.get_mut(entity) {
+        } else if let Ok((_, _, _, _, _, Some(mut cooldown))) = fighters.get_mut(entity) {
             cooldown.0 = value;
         } else {
             commands.entity(entity).insert(AttackCooldown(value));
@@ -502,7 +502,7 @@ fn attack_system(
     // reaches zero as dead; `death_system` despawns them. Pure victims are
     // edited in place, so a second strike inside this same tick sees the
     // reduced health and no unit can absorb more total damage than it has HP.
-    // Fighters (mutable access lives in `fighter_cooldowns`) take damage
+    // Fighters (mutable access lives only on their cooldown) take damage
     // through deferred per-entity commands instead.
     for (victim, amount) in pending_damage {
         if let Ok(mut health) = victim_health.get_mut(victim) {
