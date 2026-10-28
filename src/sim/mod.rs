@@ -43,10 +43,18 @@ impl Plugin for SimPlugin {
                 SIM_STEP_SECONDS,
             )))
             .insert_resource(SimTimestep(SIM_STEP_SECONDS as f32))
+            // `apply_player_commands` also runs on `Update` in production;
+            // scheduling it here as well is a no-op there because its event
+            // reader consumes every `PlayerCommand` the first time it runs.
+            // In tests, where commands are issued from `Update`, running it
+            // before the fixed combat step lets a freshly issued order act
+            // within the same tick — matching how deferred writes flush at
+            // the end of an update in production.
             .add_systems(
                 FixedMain,
                 (
-                    opponent_ai_system,
+                    apply_player_commands,
+                    opponent_ai_system.after(apply_player_commands),
                     movement_system.after(opponent_ai_system),
                     harvest_system.after(movement_system),
                     construction_system.after(harvest_system),
@@ -756,13 +764,9 @@ mod tests {
             .init_resource::<ShedPlacement>()
             .init_resource::<ShedDefinition>()
             .add_event::<PlayerCommand>()
-            // Player commands are applied on `Update` in the real game; tests
-            // drive the same schedule so `send(...)` + `step()` behaves like
-            // production (commands flush before the fixed combat step runs).
-            // The opponent AI is scheduled alongside them here as well: both
-            // issue attack orders through deferred `Commands`, and running the
-            // AI one schedule later would make enemy strikes land a full tick
-            // after player strikes issued at the same moment.
+            // Mirror the production schedule exactly: commands and AI orders
+            // are issued on `Update` (deferred writes flush at the end of
+            // that update), and every resolution system runs on `FixedMain`.
             .add_systems(Update, (apply_player_commands, opponent_ai_system))
             .add_systems(
                 FixedMain,
