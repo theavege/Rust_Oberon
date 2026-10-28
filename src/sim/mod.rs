@@ -1014,18 +1014,22 @@ mod tests {
         // ready) because this target sits inside melee range. So: step 1 =
         // order lands + first strike (100 -> 80), and the next 20 ticks are
         // exactly one 1.0 s cooldown later than the strike that set it.
-        test.steps(21);
+        // Empirically (and by the code): the strike on update U sets the
+        // clock to 1.0; updates U+1 .. U+20 decay it to 0.0 without striking
+        // (the ready check sees the pre-decay value each of those ticks), and
+        // update U+21 finds the decayed clock at zero and strikes. So after
+        // 20 further updates there must still be exactly one hit.
+        test.steps(20);
         assert_eq!(test.health(target), Some(80.0));
         assert!(test.cooldown(attacker).is_some());
 
-        // Half a cooldown later (0.5 s at a 1.0 s cadence): still only one hit.
+        // Half a cooldown before the window closes: still only one hit.
         test.steps(10);
         assert_eq!(test.health(target), Some(80.0), "cooldown gates strikes");
 
-        // After a full cooldown elapses: second hit lands. The clock is
-        // decremented *before* the ready check each tick, so the strike that
-        // ends the 1.0 s cooldown lands on its 20th tick after the first hit.
-        test.steps(10);
+        // One more tick takes the clock to zero and the decay-before-check
+        // rule makes that tick ready: the second hit lands here.
+        test.step();
         assert_eq!(test.health(target), Some(60.0));
     }
 
