@@ -981,8 +981,10 @@ mod tests {
         test.steps(10);
         assert_eq!(test.health(target), Some(80.0), "cooldown gates strikes");
 
-        // After a full cooldown elapses: second hit lands.
-        test.steps(10);
+        // After a full cooldown elapses: second hit lands. The clock is
+        // decremented *before* the ready check each tick, so the strike that
+        // ends the 1.0 s cooldown lands on its 20th tick after the first hit.
+        test.steps(11);
         assert_eq!(test.health(target), Some(60.0));
     }
 
@@ -1003,7 +1005,9 @@ mod tests {
             Some(80.0),
             "scaled cooldown halves rate"
         );
-        test.steps(20); // the doubled cooldown (2 s) now allows the second hit
+        // The doubled cooldown is 2 s = 40 ticks; the clock decays before the
+        // ready check, so the second strike lands on tick 41 after the first.
+        test.steps(21); // the doubled cooldown (2 s) now allows the second hit
         assert_eq!(test.health(target), Some(60.0));
     }
 
@@ -1028,13 +1032,15 @@ mod tests {
     }
 
     #[test]
-    fn move_order_cancels_the_attack_order() {
+    fn move_order_cancels_the_attack_order_before_any_strike() {
         let mut test = TestApp::new();
         let attacker = test.spawn_unit(UnitKind::Warrior, 0, Vec2::ZERO, true);
-        let target = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 10.0, false);
+        // Just outside the warrior's 30.0 melee range: no strike can land
+        // before the cancel, so this proves the order itself is dropped.
+        let target = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 35.0, false);
 
         test.send(PlayerCommand::Attack(target));
-        test.step();
+        test.step(); // apply the order; the attacker starts walking into range
         assert!(test.has_attack_order(attacker));
 
         test.send(PlayerCommand::MoveSelected(Vec2::new(32.0, -8.0)));
