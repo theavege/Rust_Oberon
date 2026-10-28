@@ -520,7 +520,7 @@ fn attack_system(
         // target must keep ticking every tick, or it would arrive out of
         // phase with its own clock and wait a full extra cycle (or strike
         // instantly) on arrival.
-        let remaining = cooldown.map(|clock| *clock - dt);
+        let remaining = cooldown.map(|clock| clock - dt);
         let ready = remaining.unwrap_or(0.0) <= 0.0;
         if distance > combat.range_for(kind) {
             if let Some(decayed) = remaining {
@@ -963,6 +963,30 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn dbg_cooldown_trace() {
+        let mut test = TestApp::new();
+        let attacker = test.spawn_unit(UnitKind::Warrior, 0, Vec2::ZERO, true);
+        let target = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 10.0, false);
+        test.send(PlayerCommand::Attack(target));
+        for i in 0..45 {
+            test.step();
+            println!("tick {} hp={:?} cd={:?} order={}", i + 1, test.health(target), test.cooldown(attacker), test.has_attack_order(attacker));
+        }
+    }
+
+    #[test]
+    fn dbg_far_enemy_trace() {
+        let mut test = TestApp::new();
+        let victim = test.spawn_unit(UnitKind::Peasant, 0, Vec2::ZERO, false);
+        let enemy = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 380.0, false);
+        for i in 0..6 {
+            test.step();
+            println!("tick {} order={:?} pos={:?}", i + 1, test.attack_target(enemy), test.position(enemy));
+        }
+        let _ = victim;
+    }
     #[test]
     fn attacks_only_land_within_range() {
         let mut test = TestApp::new();
