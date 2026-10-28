@@ -2,7 +2,6 @@
 
 pub mod conf;
 pub mod datamanifest;
-pub(crate) mod dbg_tmp;
 pub mod gamestate;
 pub mod map;
 pub mod mapfile;

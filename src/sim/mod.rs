@@ -225,9 +225,8 @@ fn approach_path(navigation: &NavigationGrid, start: IVec2, goal: IVec2, range: 
             // then break ties toward cells nearer the attacker. Grid distance
             // alone is not enough: iso cells with equal grid offsets can sit
             // at very different world distances from the target.
-            let proximity = f64::from(
-                (start.x - cell.x).unsigned_abs() + (start.y - cell.y).unsigned_abs(),
-            );
+            let proximity =
+                f64::from((start.x - cell.x).unsigned_abs() + (start.y - cell.y).unsigned_abs());
             // Guaranteed-strike cells rank ahead of every fallback.
             let tier = if strike_sq <= range_sq { 0.0 } else { 1e6 };
             candidates.push((tier + strike_sq + 0.001 * proximity, cell));
@@ -418,8 +417,7 @@ fn attack_system(
     // the scheduler can prove their `Health` access disjoint even though
     // both mutate it: damage lands in place and a second strike inside the
     // same tick sees the reduced health.
-    #[allow(clippy::type_complexity)]
-    mut victims: Query<
+    #[allow(clippy::type_complexity)] mut victims: Query<
         (Entity, &Player, &WorldPosition, &mut Health),
         (With<Unit>, Without<AttackOrder>),
     >,
@@ -465,27 +463,23 @@ fn attack_system(
     #[allow(clippy::type_complexity)]
     let fighter_snapshot: Vec<(Entity, UnitKind, Vec2, u8, Entity, f32, Option<f32>)> = fighters
         .iter()
-        .map(
-            |(entity, unit, position, owner, order, cooldown, health)| {
-                (
-                    entity,
-                    unit.kind,
-                    position.0,
-                    owner.0,
-                    order.target,
-                    health.current,
-                    cooldown.map(|cooldown| cooldown.0),
-                )
-            },
-        )
+        .map(|(entity, unit, position, owner, order, cooldown, health)| {
+            (
+                entity,
+                unit.kind,
+                position.0,
+                owner.0,
+                order.target,
+                health.current,
+                cooldown.map(|cooldown| cooldown.0),
+            )
+        })
         .collect();
     let attacking_rows: HashSet<Entity> = fighter_snapshot.iter().map(|row| row.0).collect();
     #[allow(clippy::type_complexity)]
     let fighter_rows: HashMap<Entity, (u8, Vec2, f32)> = fighter_snapshot
         .iter()
-        .map(|&(entity, _, position, owner, _, health, _)| {
-            (entity, (owner, position, health))
-        })
+        .map(|&(entity, _, position, owner, _, health, _)| (entity, (owner, position, health)))
         .collect();
 
     // Decide every strike for this tick first, then apply them in one pass.
@@ -629,7 +623,9 @@ fn target_is_valid(
     target: Entity,
     owner: u8,
 ) -> bool {
-    let row = victim_rows.get(&target).or_else(|| fighter_rows.get(&target));
+    let row = victim_rows
+        .get(&target)
+        .or_else(|| fighter_rows.get(&target));
     row.is_some_and(|(player, _, health)| *player != owner && *health > 0.0)
 }
 
@@ -720,11 +716,7 @@ fn opponent_ai_system(
         } else {
             entity_commands.remove::<MovePath>();
         }
-        entity_commands.insert((
-            AttackOrder { target },
-            AttackCooldown::default(),
-            Attacking,
-        ));
+        entity_commands.insert((AttackOrder { target }, AttackCooldown::default(), Attacking));
     }
 }
 
@@ -965,28 +957,18 @@ mod tests {
 
 
     #[test]
-    fn dbg_cooldown_trace() {
+    fn zz_trace() {
         let mut test = TestApp::new();
         let attacker = test.spawn_unit(UnitKind::Warrior, 0, Vec2::ZERO, true);
         let target = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 10.0, false);
+        eprintln!("after ctor: hp={:?} cd={:?} order={}", test.health(target), test.cooldown(attacker), test.has_attack_order(attacker));
         test.send(PlayerCommand::Attack(target));
-        for i in 0..45 {
+        for i in 1..=45 {
             test.step();
-            println!("tick {} hp={:?} cd={:?} order={}", i + 1, test.health(target), test.cooldown(attacker), test.has_attack_order(attacker));
+            eprintln!("step {}: hp={:?} cd={:?} order={} ap={:.3}", i, test.health(target), test.cooldown(attacker), test.has_attack_order(attacker), test.app.world().resource::<bevy::time::Time<Fixed>>().overstep().as_secs_f32());
         }
     }
 
-    #[test]
-    fn dbg_far_enemy_trace() {
-        let mut test = TestApp::new();
-        let victim = test.spawn_unit(UnitKind::Peasant, 0, Vec2::ZERO, false);
-        let enemy = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 380.0, false);
-        for i in 0..6 {
-            test.step();
-            println!("tick {} order={:?} pos={:?}", i + 1, test.attack_target(enemy), test.position(enemy));
-        }
-        let _ = victim;
-    }
     #[test]
     fn attacks_only_land_within_range() {
         let mut test = TestApp::new();
