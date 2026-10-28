@@ -206,56 +206,246 @@ fn apply_player_commands(
     }
 }
 
-/// Path an attacking unit walks toward a target standing on `goal`, aiming to
-/// reach a cell from which it can strike — i.e. whose center lies within
-/// `range` world units of the target's cell center — instead of walking onto
-/// the target's own cell. Candidate cells are ranked by how close they sit to
-/// the target (guaranteed-strike cells first, then nearest-outside fallbacks),
-/// with ties broken toward the attacker's current position so nearby targets
-/// produce short, legible approach routes. When no walkable cell within the
-/// search window can cover the target, the unit paths to the closest walkable
-/// cell beside the target at all; when even that fails, no route exists and
-/// the caller rejects the order.
-fn approach_path(navigation: &NavigationGrid, start: IVec2, goal: IVec2, range: f32) -> Vec<IVec2> {
-    let range_sq = f64::from(range * range);
-    let goal_center = NavigationGrid::cell_center(goal);
-    // Isometric tiles span 16 px horizontally and 8 px vertically per cell,
-    // so a fixed cell window would shrink for tall/flat ranges. Widen the
-    // search until every cell outside it is provably farther than `range`.
-    let half_x = (range / 16.0).ceil() as i32 + 2;
-    let half_y = (range / 8.0).ceil() as i32 + 2;
-    let window = half_x.max(half_y).max(7);
+/// Cell step costs for the approach search: orthogonal 10, diagonal 14 —
+/// identical to `NavigationGrid::find_path` so route lengths stay comparable.
+const CELL_STEP_COST: u32 = 10;
+const CELL_DIAG_STEP_COST: u32 = 14;
 
-    let mut candidates: Vec<(f64, IVec2)> = Vec::new();
-    for y in (goal.y - window)..=(goal.y + window) {
-        for x in (goal.x - window)..=(goal.x + window) {
-            let cell = IVec2::new(x, y);
-            if !navigation.is_walkable(cell) {
+/// Octile-style cell distance (same metric as `NavigationGrid::find_path`'s
+/// heuristic), used both as the A* heuristic and as an admissible lower bound
+/// on world distance between two cell centres.
+fn heuristic_cells(a: IVec2, b: IVec2) -> u32 {
+    let dx = (a.x - b.x).unsigned_abs();
+    let dy = (a.y - b.y).unsigned_abs();
+    14 * dx.min(dy) + 10 * (dx.max(dy) - dx.min(dy))
+}
+
+/// Distance from `position` to the closest point of the axis-aligned
+/// rectangle spanned by `cells`, in isometric world units. The rectangle is
+/// padded by half a tile (8 px horizontally, 4 px vertically) so cells whose
+/// centres sit just outside the footprint still count as covering it. Used to
+/// decide whether a unit standing at `position` can strike a multi-cell
+/// target (buildings) or a single-cell unit with `range`.
+fn rect_distance(position: Vec2, cells: &[IVec2]) -> f32 {
+    if cells.is_empty() {
+        return f32::INFINITY;
+    }
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for cell in cells {
+        let center = NavigationGrid::cell_center(*cell);
+        min_x = min_x.min(center.x);
+        max_x = max_x.max(center.x);
+        min_y = min_y.min(center.y);
+        max_y = max_y.max(center.y);
+    }
+    min_x -= 8.0;
+    max_x += 8.0;
+    min_y -= 4.0;
+    max_y += 4.0;
+    let dx = (min_x - position.x).max(0.0).max(position.x - max_x);
+    let dy = (min_y - position.y).max(0.0).max(position.y - max_y);
+    (dx * dx + dy * dy).sqrt()
+}
+
+/// Lower bound on the world distance between the centres of two cells under
+/// the isometric projection (a horizontal neighbour step moves 16 px, a
+/// vertical one 8 px, so the cheapest per-cell displacement is 8 px).
+fn cell_world_lower_bound(from: IVec2, to: IVec2) -> f32 {
+    let dx = (from.x - to.x).unsigned_abs();
+    let dy = (from.y - to.y).unsigned_abs();
+    // Cheapest case: pure vertical movement at 8 px per cell.
+    8.0 * (dx + dy) as f32
+}
+
+/// Static inputs for one attack-approach search: the grid, the attacker's
+/// start cell, the target's footprint cells, the cells that must not be used
+/// as the final stopping cell, and the combat range. All query data is
+/// collected into plain vectors before the search starts so the loop borrows
+/// nothing from the Bevy world.
+struct ApproachContext<'a> {
+    navigation: &'a NavigationGrid,
+    start: IVec2,
+    /// Cells occupied by the target itself (its footprint). Routes may cross
+    /// them but never end on them.
+    target_cells: Vec<IVec2>,
+    /// Cells off-limits as the *stopping* cell: reserved building footprints
+    /// plus other living units' current cells (units do not physically stack).
+    blocked_stop: Vec<IVec2>,
+    range: f32,
+}
+
+impl ApproachContext<'_> {
+    fn index(&self, cell: IVec2) -> usize {
+        self.navigation.cell_index(cell)
+    }
+
+    fn in_bounds(&self, cell: IVec2) -> bool {
+        cell.x >= 0
+            && cell.y >= 0
+            && cell.x < self.navigation.width as i32
+            && cell.y < self.navigation.height as i32
+    }
+
+    /// Passable for *traversal*: terrain only. Reserved footprints are legal
+    /// to walk across en route (they belong to dynamic objects such as
+    /// construction sites); routes simply refuse to *end* on them.
+    fn traversable(&self, cell: IVec2) -> bool {
+        self.in_bounds(cell) && self.navigation.is_terrain_walkable(cell)
+    }
+
+    /// True when a unit standing on `cell` can hit the target with `range`.
+    fn covers_target(&self, cell: IVec2) -> bool {
+        rect_distance(NavigationGrid::cell_center(cell), &self.target_cells) <= self.range
+    }
+
+    /// Admissible A* heuristic: minimum possible world distance from `cell`
+    /// to any target cell, minus the weapon range. Zero exactly where the
+    /// unit can already strike, and never overestimates the remaining cost
+    /// (measured in world pixels), so the first strike-capable cell the search
+    /// pops is reached by a shortest-cost route among the explored region.
+    fn heuristic(&self, cell: IVec2) -> f32 {
+        let mut best = f32::INFINITY;
+        for &target in &self.target_cells {
+            let bound = cell_world_lower_bound(cell, target) - self.range;
+            if bound < best {
+                best = bound;
+            }
+        }
+        best.max(0.0)
+    }
+}
+
+/// Path an attacking unit walks toward a target, aiming to reach a cell from
+/// which it can strike — i.e. whose world position lies within `range` of the
+/// target's footprint rectangle — instead of walking onto the target itself.
+///
+/// This is a bounded A* over the navigation grid whose goal set is "any cell
+/// that covers the target" rather than a single destination, so the route
+/// naturally bends around walls, water and building footprints and stops at
+/// the first cell in range. Traversal ignores reserved footprints (routes may
+/// cross them), while the chosen stopping cell avoids the target's own cells,
+/// reserved cells and other units' positions. Diagonal corner cutting is
+/// forbidden, matching `NavigationGrid::find_path`.
+///
+/// The search expands at most `bound` cells. When no reachable strike position
+/// exists inside that budget — e.g. a target walled off behind impassable
+/// terrain — the function returns an empty vector and callers reject the
+/// order, leaving the unit holding no permanent unreachable attack.
+fn approach_path(ctx: &ApproachContext, bound: usize) -> Vec<IVec2> {
+    if !ctx.traversable(ctx.start) {
+        return Vec::new();
+    }
+    // Priority queue keyed by (f-score in milli-pixels, insertion-order
+    // tiebreak, cell index); BinaryHeap is a max-heap so entries are reversed.
+    let mut heap: BinaryHeap<std::cmp::Reverse<(i64, u64, usize)>> = BinaryHeap::new();
+    let mut g_score: HashMap<usize, u32> = HashMap::new();
+    let mut came_from: HashMap<usize, usize> = HashMap::new();
+    let start_idx = ctx.index(ctx.start);
+    g_score.insert(start_idx, 0);
+    let mut counter = 0u64;
+    heap.push(std::cmp::Reverse((
+        (ctx.heuristic(ctx.start) * 1000.0) as i64,
+        counter,
+        start_idx,
+    )));
+    counter += 1;
+
+    const NEIGHBORS: [(i32, i32); 8] = [
+        (-1, 0),
+        (1, 0),
+        (0, -1),
+        (0, 1),
+        (-1, -1),
+        (-1, 1),
+        (1, -1),
+        (1, 1),
+    ];
+
+    let mut visited: HashSet<usize> = HashSet::new();
+    let mut expanded = 0usize;
+    while let Some(std::cmp::Reverse((_, _, idx))) = heap.pop() {
+        if !visited.insert(idx) {
+            continue;
+        }
+        expanded += 1;
+        if expanded > bound {
+            break;
+        }
+        let cell = IVec2::new(
+            (idx as u32 % ctx.navigation.width) as i32,
+            (idx as u32 / ctx.navigation.width) as i32,
+        );
+        // Goal test: a cell the attacker can stand on and strike from. The
+        // start cell is skipped so an out-of-range attacker always produces a
+        // non-empty route (callers treat an empty path as "no approach").
+        if cell != ctx.start
+            && ctx.covers_target(cell)
+            && !ctx.target_cells.contains(&cell)
+            && !ctx.blocked_stop.contains(&cell)
+        {
+            return reconstruct_path(&came_from, start_idx, idx, ctx.navigation);
+        }
+        let current_cost = g_score[&idx];
+        for (dx, dy) in NEIGHBORS {
+            let next = cell + IVec2::new(dx, dy);
+            if !ctx.traversable(next) {
                 continue;
             }
-            let center = NavigationGrid::cell_center(cell);
-            let delta = center - goal_center;
-            let strike_sq = f64::from(delta.length_squared());
-            // Rank primarily by world distance to the target's cell center,
-            // then break ties toward cells nearer the attacker. Grid distance
-            // alone is not enough: iso cells with equal grid offsets can sit
-            // at very different world distances from the target.
-            let proximity =
-                f64::from((start.x - cell.x).unsigned_abs() + (start.y - cell.y).unsigned_abs());
-            // Guaranteed-strike cells rank ahead of every fallback.
-            let tier = if strike_sq <= range_sq { 0.0 } else { 1e6 };
-            candidates.push((tier + strike_sq + 0.001 * proximity, cell));
+            if dx != 0 && dy != 0 {
+                // No corner cutting through blocked terrain.
+                if !ctx.traversable(IVec2::new(cell.x + dx, cell.y))
+                    || !ctx.traversable(IVec2::new(cell.x, cell.y + dy))
+                {
+                    continue;
+                }
+            }
+            let step_cost = if dx == 0 || dy == 0 {
+                CELL_STEP_COST
+            } else {
+                CELL_DIAG_STEP_COST
+            };
+            let new_cost = current_cost + step_cost;
+            let next_idx = ctx.index(next);
+            if g_score.get(&next_idx).is_some_and(|&old| old <= new_cost) {
+                continue;
+            }
+            g_score.insert(next_idx, new_cost);
+            came_from.insert(next_idx, idx);
+            let f = (new_cost as f32 * 8.0 + ctx.heuristic(next)) * 1000.0;
+            heap.push(std::cmp::Reverse(((f.round() as i64).max(0), counter, next_idx)));
+            counter += 1;
         }
     }
-    let Some(destination) = candidates
-        .into_iter()
-        .min_by(|a, b| a.0.total_cmp(&b.0))
-        .map(|(_, cell)| cell)
-        .or_else(|| navigation.nearest_walkable_in(goal, window))
-    else {
-        return Vec::new();
-    };
-    navigation.find_path(start, destination).unwrap_or_default()
+    Vec::new()
+}
+
+/// Walk the `came_from` parent links backwards from `end` to `start` and
+/// return the forward list of cells (excluding `start`, matching
+/// `NavigationGrid::find_path`'s contract).
+fn reconstruct_path(
+    came_from: &HashMap<usize, usize>,
+    start_idx: usize,
+    end_idx: usize,
+    navigation: &NavigationGrid,
+) -> Vec<IVec2> {
+    let width = navigation.width;
+    let mut path = Vec::new();
+    let mut cursor = end_idx;
+    while cursor != start_idx {
+        path.push(IVec2::new(
+            (cursor as u32 % width) as i32,
+            (cursor as u32 / width) as i32,
+        ));
+        match came_from.get(&cursor) {
+            Some(&parent) => cursor = parent,
+            None => return Vec::new(),
+        }
+    }
+    path.reverse();
+    path
 }
 
 fn can_place_shed(

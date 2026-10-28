@@ -85,7 +85,7 @@ impl NavigationGrid {
         true
     }
 
-    fn cell_index(&self, cell: IVec2) -> usize {
+    pub(crate) fn cell_index(&self, cell: IVec2) -> usize {
         (cell.y as u32 * self.width + cell.x as u32) as usize
     }
 
