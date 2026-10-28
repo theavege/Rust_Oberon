@@ -433,7 +433,7 @@ fn attack_system(
     // `Time<Fixed>` only exposes the timestep through `State<Time<Fixed>>`
     // (a `Ref`, not a system param), so read it once and cache it as a
     // resource; `SimPlugin::build` inserts the same constant up front.
-    let dt = timestep.get();
+    let dt = timestep.0;
     // Snapshot every unit up front: a lethal strike inside this same step
     // must not stop another attacker from also landing its blow, and the
     // damage pass below never re-reads state while a query is iterating.
