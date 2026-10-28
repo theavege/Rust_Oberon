@@ -6,7 +6,7 @@ pub mod setup;
 use bevy::app::FixedMain;
 use bevy::prelude::*;
 use bevy::time::{TimeUpdateStrategy, Virtual};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::time::Duration;
 
 use crate::core::{
@@ -80,7 +80,11 @@ fn apply_player_commands(
     shed: Res<ShedDefinition>,
     units: Query<(Entity, &Unit, Option<&Selected>, &WorldPosition), With<Player>>,
     nodes: Query<&WorldPosition, (With<ResourceNode>, Without<Unit>)>,
-    enemy_targets: Query<(&Health, &Player, &WorldPosition), With<Unit>>,
+    enemy_targets: Query<
+        (&Health, &Player, &WorldPosition, Option<&Building>),
+        Or<(With<Unit>, With<Building>)>,
+    >,
+    other_units: Query<&WorldPosition, With<Unit>>,
     combat: Res<CombatDefinition>,
 ) {
     for message in messages.read() {
@@ -161,9 +165,10 @@ fn apply_player_commands(
                 ));
             }
             PlayerCommand::Attack(target) => {
-                // Validate the target: it must be a unit and not belong to the
-                // issuing player (no friendly fire, no attacking scenery).
-                let Ok((target_health, target_player, target_position)) = enemy_targets.get(target)
+                // Validate the target: it must be a living enemy unit or an
+                // enemy building (no friendly fire, no attacking scenery).
+                let Ok((target_health, target_player, target_position, target_building)) =
+                    enemy_targets.get(target)
                 else {
                     continue;
                 };
@@ -174,15 +179,32 @@ fn apply_player_commands(
                     if selected.is_none() || !combat.can_attack(unit.kind) {
                         continue;
                     }
-                    let distance = position.0.distance(target_position.0);
                     let range = combat.range_for(unit.kind);
+                    // The target's strikeable cells: its footprint when it is
+                    // a building, otherwise the single cell it stands on. All
+                    // reach checks and approach searches use world distance to
+                    // this rectangle, so archers snipe from afar and melee
+                    // units walk right up next to their prey.
+                    let cells = target_cells_for(
+                        |point| navigation.world_to_cell(point),
+                        target_building,
+                        target_position.0,
+                    );
                     let mut entity_commands = commands.entity(entity);
-                    if distance > range {
+                    if rect_distance(position.0, &cells) > range {
                         // Out of reach: queue the approach route and attach the
                         // order only once the path exists (see below).
-                        let start = navigation.world_to_cell(position.0);
-                        let goal_cell = navigation.world_to_cell(target_position.0);
-                        let path = approach_path(&navigation, start, goal_cell, range);
+                        let ctx = make_approach_context(
+                            &navigation,
+                            position.0,
+                            cells,
+                            other_units
+                                .iter()
+                                .filter(|other| other.0 != position.0),
+                            range,
+                            |grid, point| grid.world_to_cell(point),
+                        );
+                        let path = approach_path(&ctx, APPROACH_EXPANSION_BOUND);
                         if path.is_empty() {
                             // No reachable attack position: do not leave a
                             // permanent order against a target this unit can
@@ -265,16 +287,16 @@ fn cell_world_lower_bound(from: IVec2, to: IVec2) -> f32 {
 /// as the final stopping cell, and the combat range. All query data is
 /// collected into plain vectors before the search starts so the loop borrows
 /// nothing from the Bevy world.
-struct ApproachContext<'a> {
-    navigation: &'a NavigationGrid,
-    start: IVec2,
+pub struct ApproachContext<'a> {
+    pub navigation: &'a NavigationGrid,
+    pub start: IVec2,
     /// Cells occupied by the target itself (its footprint). Routes may cross
     /// them but never end on them.
-    target_cells: Vec<IVec2>,
+    pub target_cells: Vec<IVec2>,
     /// Cells off-limits as the *stopping* cell: reserved building footprints
     /// plus other living units' current cells (units do not physically stack).
-    blocked_stop: Vec<IVec2>,
-    range: f32,
+    pub blocked_stop: Vec<IVec2>,
+    pub range: f32,
 }
 
 impl ApproachContext<'_> {
@@ -315,6 +337,60 @@ impl ApproachContext<'_> {
             }
         }
         best.max(0.0)
+    }
+}
+
+/// Upper bound on A* expansions per attack-approach search. On the shipped
+/// map this comfortably covers cross-map routes while keeping a pathological
+/// (e.g. walled-off) target from stalling a fixed-step tick.
+const APPROACH_EXPANSION_BOUND: usize = 20_000;
+
+/// Collect the static inputs for one attack-approach search out of the world:
+/// the target's own cells (footprint for buildings, current cell for units),
+/// the cells other living units currently occupy (attackers never stop on top
+/// of a third party), and the attacker's start cell. Everything is copied into
+/// plain data so `approach_path` borrows nothing from the Bevy world.
+///
+/// `cell_of` maps a world position to its navigation cell; tests override it
+/// because their virtual units do not sit exactly on cell centres.
+fn make_approach_context<'a>(
+    navigation: &'a NavigationGrid,
+    attacker_position: Vec2,
+    target_cells: Vec<IVec2>,
+    other_units: impl Iterator<Item = &'a WorldPosition>,
+    range: f32,
+    cell_of: impl Fn(&'a NavigationGrid, Vec2) -> IVec2,
+) -> ApproachContext<'a> {
+    let blocked_stop: Vec<IVec2> = other_units
+        .map(|position| cell_of(navigation, position.0))
+        .collect();
+    ApproachContext {
+        navigation,
+        start: cell_of(navigation, attacker_position),
+        target_cells,
+        blocked_stop,
+        range,
+    }
+}
+
+/// Cells belonging to an attack target entity: the full footprint for
+/// buildings (under construction or complete), otherwise the single cell the
+/// unit currently stands on. `cell_of` converts a world position to its
+/// navigation cell (production uses the grid's inverse projection; tests use
+/// rounding because their virtual units do not sit exactly on cell centres).
+fn target_cells_for(
+    cell_of: impl Fn(Vec2) -> IVec2,
+    building: Option<&Building>,
+    target_position: Vec2,
+) -> Vec<IVec2> {
+    if let Some(building) = building {
+        let origin = cell_of(target_position);
+        let footprint = building.footprint;
+        (0..footprint.y)
+            .flat_map(|dy| (0..footprint.x).map(move |dx| origin + IVec2::new(dx, dy)))
+            .collect()
+    } else {
+        vec![cell_of(target_position)]
     }
 }
 
@@ -415,7 +491,11 @@ fn approach_path(ctx: &ApproachContext, bound: usize) -> Vec<IVec2> {
             g_score.insert(next_idx, new_cost);
             came_from.insert(next_idx, idx);
             let f = (new_cost as f32 * 8.0 + ctx.heuristic(next)) * 1000.0;
-            heap.push(std::cmp::Reverse(((f.round() as i64).max(0), counter, next_idx)));
+            heap.push(std::cmp::Reverse((
+                (f.round() as i64).max(0),
+                counter,
+                next_idx,
+            )));
             counter += 1;
         }
     }
@@ -616,15 +696,15 @@ fn attack_system(
         ),
         (With<Unit>, With<AttackOrder>),
     >,
-    // Pure victims — every unit not holding an attack order this tick. The
-    // fighter query filters `With<AttackOrder>` and this one filters
-    // `Without<AttackOrder>`, so no entity can appear in both queries and
-    // the scheduler can prove their `Health` access disjoint even though
-    // both mutate it: damage lands in place and a second strike inside the
-    // same tick sees the reduced health.
+    // Pure victims — every unit not holding an attack order this tick, plus
+    // buildings (which never fight back). The fighter query filters
+    // `With<AttackOrder>` and this one filters `Without<AttackOrder>`, so no
+    // entity can appear in both queries and the scheduler can prove their
+    // `Health` access disjoint even though both mutate it: damage lands in
+    // place and a second strike inside the same tick sees the reduced health.
     #[allow(clippy::type_complexity)] mut victims: Query<
         (Entity, &Player, &WorldPosition, &mut Health),
-        (With<Unit>, Without<AttackOrder>),
+        (Without<AttackOrder>, Or<(With<Unit>, With<Building>)>),
     >,
 ) {
     // The cooldown is a countdown clock, so it must advance by exactly one
@@ -908,10 +988,23 @@ fn opponent_ai_system(
             continue;
         };
         let mut entity_commands = commands.entity(entity);
-        if position.0.distance(target_position.0) > combat.range_for(unit.kind) {
-            let start = navigation.world_to_cell(position.0);
-            let goal_cell = navigation.world_to_cell(target_position.0);
-            let path = approach_path(&navigation, start, goal_cell, combat.range_for(unit.kind));
+        let cells = target_cells_for(
+            |point| navigation.world_to_cell(point),
+            None,
+            target_position.0,
+        );
+        if rect_distance(position.0, &cells) > combat.range_for(unit.kind) {
+            let ctx = make_approach_context(
+                &navigation,
+                position.0,
+                cells,
+                victims.iter().filter_map(|(_, _, other, _)| {
+                    (other.0 != position.0).then_some(other)
+                }),
+                combat.range_for(unit.kind),
+                |grid, point| grid.world_to_cell(point),
+            );
+            let path = approach_path(&ctx, APPROACH_EXPANSION_BOUND);
             if path.is_empty() {
                 // Unreachable: no point holding a permanent order the enemy
                 // can never execute; it will re-evaluate next tick.
