@@ -5,7 +5,7 @@ pub mod setup;
 
 use bevy::app::FixedMain;
 use bevy::prelude::*;
-use bevy::time::TimeUpdateStrategy;
+use bevy::time::{TimeUpdateStrategy, Virtual};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -751,7 +751,11 @@ mod tests {
         // `MinimalPlugins` already provides `TimePlugin`, so only the virtual
         // clock and the manual update strategy are added here. Without a
         // strategy the virtual clock advances by wall-clock time, which makes
-        // fixed ticks (and cooldowns) non-deterministic in tests.
+        // fixed ticks (and cooldowns) non-deterministic in tests. The delta
+        // is *set* to exactly one timestep per `step()` through
+        // `ManualDuration` below — never merely accumulated on top of the
+        // real elapsed time — so every update runs precisely one fixed tick
+        // regardless of how long the host machine takes between updates.
         app.add_plugins(MinimalPlugins)
             .insert_resource(Time::<Virtual>::default())
             .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
@@ -765,8 +769,11 @@ mod tests {
             .init_resource::<ShedDefinition>()
             .add_event::<PlayerCommand>()
             // Mirror the production schedule exactly: commands and AI orders
-            // are issued on `Update` (deferred writes flush at the end of
-            // that update), and every resolution system runs on `FixedMain`.
+            // are issued from `Update` via events, deferred writes flush at
+            // the end of that update, and every resolution system runs on
+            // `FixedMain` — the same shape as `SimPlugin` in production,
+            // where `apply_player_commands` also consumes the event queue
+            // before the first fixed step of an update can see it.
             .add_systems(Update, (apply_player_commands, opponent_ai_system))
             .add_systems(
                 FixedMain,

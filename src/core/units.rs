@@ -87,6 +87,9 @@ impl Health {
 }
 
 /// Seconds until this unit may attack again (combat cooldown state).
+/// A freshly ordered attacker starts at zero — "ready to strike" — which is
+/// what `Default` provides; do not change that default, as order assignment
+/// relies on it.
 #[derive(Component, Debug, Default)]
 pub struct AttackCooldown(pub f32);
 
