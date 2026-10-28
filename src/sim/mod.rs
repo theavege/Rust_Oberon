@@ -35,7 +35,14 @@ impl Plugin for SimPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, setup::spawn_initial_units)
             .add_event::<PlayerCommand>()
-            .add_systems(Update, (apply_player_commands, update_shed_placement))
+            // `apply_player_commands` also runs on `Update` in production;
+            // scheduling it here as well is a no-op there because its event
+            // reader consumes every `PlayerCommand` the first time it runs.
+            // In tests, where commands are issued from `Update`, running it
+            // before the fixed combat step lets a freshly issued order act
+            // within the same tick — matching how deferred writes flush at
+            // the end of an update in production.
+            .add_systems(Update, update_shed_placement)
             // The simulation runs on `FixedMain`, driven at a fixed frequency
             // by the time plugin's catch-up loop. Tests drive the same
             // schedule deterministically with a manual virtual clock.
@@ -744,18 +751,22 @@ mod tests {
 
     /// Build a bare Bevy app that runs exactly the production schedules
     /// (same systems, same ordering) without any rendering, window or real
-    /// clock. Time uses a virtual clock, so each `step()` below advances the
-    /// simulation by precisely one fixed tick of `DT` seconds.
+    /// clock. Time uses a virtual clock driven by `ManualDuration(DT)`: every
+    /// `app.update()` — including the internal frames that run `Startup` and
+    /// the first `Update` — has a delta of exactly one timestep, so each
+    /// update executes precisely one `FixedMain` tick. The harness's priming
+    /// update (see `TestApp::with_combat`) absorbs the startup frame; from
+    /// then on every explicit `step()` is exactly one tick, fully
+    /// deterministic and independent of host wall-clock time.
     fn combat_test_app(combat: CombatDefinition) -> App {
         let mut app = App::new();
         // `MinimalPlugins` already provides `TimePlugin`, so only the virtual
         // clock and the manual update strategy are added here. Without a
         // strategy the virtual clock advances by wall-clock time, which makes
         // fixed ticks (and cooldowns) non-deterministic in tests. The delta
-        // is *set* to exactly one timestep per `step()` through
+        // is *set* to exactly one timestep per update through
         // `ManualDuration` below — never merely accumulated on top of the
-        // real elapsed time — so every update runs precisely one fixed tick
-        // regardless of how long the host machine takes between updates.
+        // real elapsed time.
         app.add_plugins(MinimalPlugins)
             .insert_resource(Time::<Virtual>::default())
             .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
@@ -964,20 +975,6 @@ mod tests {
             !test.has_attack_order(attacker),
             "orders against dead targets drop"
         );
-    }
-
-
-    #[test]
-    fn zz_trace() {
-        let mut test = TestApp::new();
-        let attacker = test.spawn_unit(UnitKind::Warrior, 0, Vec2::ZERO, true);
-        let target = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 10.0, false);
-        eprintln!("after ctor: hp={:?} cd={:?} order={}", test.health(target), test.cooldown(attacker), test.has_attack_order(attacker));
-        test.send(PlayerCommand::Attack(target));
-        for i in 1..=45 {
-            test.step();
-            eprintln!("step {}: hp={:?} cd={:?} order={} ap={:.3}", i, test.health(target), test.cooldown(attacker), test.has_attack_order(attacker), test.app.world().resource::<bevy::time::Time<Fixed>>().overstep().as_secs_f32());
-        }
     }
 
     #[test]
