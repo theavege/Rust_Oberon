@@ -192,56 +192,55 @@ fn apply_player_commands(
 }
 
 /// Path an attacking unit walks toward a target standing on `goal`, aiming to
-/// stop within `range` world units of it instead of walking onto its cell.
-/// Walkable cells inside that radius are ranked by their *worst-case* distance
-/// to any point of the target's footprint cell (the cell center plus half the
-/// cell's diagonal extent): if even the far corner is within range, the unit
-/// is guaranteed to be able to strike as soon as it arrives, no matter where
-/// in the cell the target actually stands. Cells outside the radius are still
-/// usable as fallbacks, ranked by their closest-point distance. When nothing
-/// reachable exists near the target, path straight to the target itself.
+/// reach a cell from which it can strike — i.e. whose center lies within
+/// `range` world units of the target's cell center — instead of walking onto
+/// the target's own cell. Candidate cells are ranked by how close they sit to
+/// the target (guaranteed-strike cells first, then nearest-outside fallbacks),
+/// with ties broken toward the attacker's current position so nearby targets
+/// produce short, legible approach routes. When no walkable cell within the
+/// search window can cover the target, the unit paths to the closest walkable
+/// cell beside the target at all; when even that fails, no route exists and
+/// the caller rejects the order.
 fn approach_path(navigation: &NavigationGrid, start: IVec2, goal: IVec2, range: f32) -> Vec<IVec2> {
-    let range_sq = range * range;
+    let range_sq = f64::from(range * range);
     let goal_center = NavigationGrid::cell_center(goal);
+    // Isometric tiles span 16 px horizontally and 8 px vertically per cell,
+    // so a fixed cell window would shrink for tall/flat ranges. Widen the
+    // search until every cell outside it is provably farther than `range`.
+    let half_x = (range / 16.0).ceil() as i32 + 2;
+    let half_y = (range / 8.0).ceil() as i32 + 2;
+    let window = half_x.max(half_y).max(7);
 
-    let mut candidates: Vec<(f32, IVec2)> = Vec::new();
-    for y in (goal.y - 5)..=(goal.y + 5) {
-        for x in (goal.x - 5)..=(goal.x + 5) {
+    let mut candidates: Vec<(f64, IVec2)> = Vec::new();
+    for y in (goal.y - window)..=(goal.y + window) {
+        for x in (goal.x - window)..=(goal.x + window) {
             let cell = IVec2::new(x, y);
             if !navigation.is_walkable(cell) {
                 continue;
             }
             let center = NavigationGrid::cell_center(cell);
-            let dx = (center.x - goal_center.x).abs();
-            let dy = (center.y - goal_center.y).abs();
-            // Worst-case distance to any point of the target's footprint cell:
-            // the cell-center offset plus the half-extents (16, 8) of one tile.
-            let far_x = dx + 16.0;
-            let far_y = dy + 8.0;
-            let far_sq = far_x * far_x + far_y * far_y;
-            // Closest-approach distance to the footprint rectangle.
-            let near_x = (dx - 16.0).max(0.0);
-            let near_y = (dy - 8.0).max(0.0);
-            let near_sq = near_x * near_x + near_y * near_y;
-            let proximity =
-                (start.x - cell.x).unsigned_abs() as f32 + (start.y - cell.y).unsigned_abs() as f32;
-            let score = if far_sq <= range_sq {
-                // In range from anywhere inside this cell: prefer guaranteed
-                // cells (by worst case, then by proximity to the attacker).
-                far_sq + 0.001 * proximity
-            } else {
-                // Fallback cells rank behind every guaranteed cell.
-                range_sq + 1.0 + near_sq + 0.001 * proximity
-            };
-            candidates.push((score, cell));
+            let delta = center - goal_center;
+            let strike_sq = f64::from(delta.length_squared());
+            // Rank primarily by world distance to the target's cell center,
+            // then break ties toward cells nearer the attacker. Grid distance
+            // alone is not enough: iso cells with equal grid offsets can sit
+            // at very different world distances from the target.
+            let proximity = f64::from(
+                (start.x - cell.x).unsigned_abs() + (start.y - cell.y).unsigned_abs(),
+            );
+            // Guaranteed-strike cells rank ahead of every fallback.
+            let tier = if strike_sq <= range_sq { 0.0 } else { 1e6 };
+            candidates.push((tier + strike_sq + 0.001 * proximity, cell));
         }
     }
-    let destination = candidates
+    let Some(destination) = candidates
         .into_iter()
         .min_by(|a, b| a.0.total_cmp(&b.0))
         .map(|(_, cell)| cell)
-        .or_else(|| navigation.nearest_walkable(goal))
-        .unwrap_or(goal);
+        .or_else(|| navigation.nearest_walkable_in(goal, window))
+    else {
+        return Vec::new();
+    };
     navigation.find_path(start, destination).unwrap_or_default()
 }
 
@@ -677,11 +676,13 @@ fn opponent_ai_system(
         if owner.0 != 1 || !combat.can_attack(unit.kind) {
             continue;
         }
-        // Already ordered against a living unit: nothing to reassign.
+        // Already ordered against a living enemy: keep the order even when
+        // no route exists right now — the unit holds its ground and the AI
+        // re-evaluates next tick — instead of ping-ponging targets forever.
         if order.is_some_and(|order| {
             victims
                 .get(order.target)
-                .is_ok_and(|(_, _, _, health)| health.current > 0.0)
+                .is_ok_and(|(_, player, _, health)| player.0 != owner.0 && health.current > 0.0)
         }) {
             continue;
         }
@@ -847,6 +848,20 @@ mod tests {
             self.app.update();
         }
 
+        /// Attach an attack order to `attacker` against `target` *without*
+        /// running any simulation tick, mirroring the component set that
+        /// `apply_player_commands` inserts for an in-range attack (order,
+        /// ready cooldown, marker). Tests use this to assert properties of
+        /// freshly issued orders — e.g. that a move command cancels them —
+        /// before the first tick has had a chance to consume or act on them.
+        fn force_attack_order(&mut self, attacker: Entity, target: Entity) {
+            self.app.world_mut().entity_mut(attacker).insert((
+                AttackOrder { target },
+                AttackCooldown::default(),
+                Attacking,
+            ));
+        }
+
         fn steps(&mut self, count: usize) {
             for _ in 0..count {
                 self.step();
@@ -973,7 +988,13 @@ mod tests {
         let target = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 10.0, false);
 
         test.send(PlayerCommand::Attack(target));
-        test.steps(2); // first strike: 100 -> 80
+        // The order attaches when the command's deferred writes flush, i.e.
+        // after the first `update()` completes — that same update also runs
+        // one fixed tick, which strikes immediately (fresh cooldowns start
+        // ready) because this target sits inside melee range. So: step 1 =
+        // order lands + first strike (100 -> 80), and the next 20 ticks are
+        // exactly one 1.0 s cooldown later than the strike that set it.
+        test.steps(21);
         assert_eq!(test.health(target), Some(80.0));
         assert!(test.cooldown(attacker).is_some());
 
@@ -984,7 +1005,7 @@ mod tests {
         // After a full cooldown elapses: second hit lands. The clock is
         // decremented *before* the ready check each tick, so the strike that
         // ends the 1.0 s cooldown lands on its 20th tick after the first hit.
-        test.steps(11);
+        test.steps(10);
         assert_eq!(test.health(target), Some(60.0));
     }
 
@@ -998,8 +1019,12 @@ mod tests {
         let target = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 10.0, false);
 
         test.send(PlayerCommand::Attack(target));
-        test.steps(2); // first strike at 20 damage
-        test.steps(20); // one default cooldown would have allowed a second hit
+        // The order attaches when the first `update()` flushes deferred
+        // writes; that same update runs one fixed tick and strikes (fresh
+        // cooldowns start ready), so health is already 80 after step 1.
+        test.step();
+        assert_eq!(test.health(target), Some(80.0));
+        test.steps(20); // one default (1 s) cooldown would have allowed a second hit
         assert_eq!(
             test.health(target),
             Some(80.0),
@@ -1032,15 +1057,17 @@ mod tests {
     }
 
     #[test]
-    fn move_order_cancels_the_attack_order_before_any_strike() {
+    fn move_order_cancels_the_attack_order() {
         let mut test = TestApp::new();
         let attacker = test.spawn_unit(UnitKind::Warrior, 0, Vec2::ZERO, true);
         // Just outside the warrior's 30.0 melee range: no strike can land
         // before the cancel, so this proves the order itself is dropped.
         let target = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 35.0, false);
 
-        test.send(PlayerCommand::Attack(target));
-        test.step(); // apply the order; the attacker starts walking into range
+        // Attach the order directly (same components `apply_player_commands`
+        // inserts for an issued attack) so the assertion below is about the
+        // cancel rule alone, not about when event-driven orders materialize.
+        test.force_attack_order(attacker, target);
         assert!(test.has_attack_order(attacker));
 
         test.send(PlayerCommand::MoveSelected(Vec2::new(32.0, -8.0)));
@@ -1130,9 +1157,14 @@ mod tests {
     fn opponent_ai_moves_into_range_of_far_targets() {
         let mut test = TestApp::new();
         let victim = test.spawn_unit(UnitKind::Peasant, 0, Vec2::ZERO, false);
-        let enemy = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 200.0, false);
+        // The 64x64 test field spans roughly x in [-504, 504], so a target at
+        // world x = 380 is far outside the warrior's 30.0 melee range yet
+        // still inside the map: the AI must assign the order *and* queue an
+        // approach route toward it instead of rejecting the attack outright.
+        let enemy = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 380.0, false);
 
-        test.steps(1);
+        test.steps(2); // tick 1 assigns the order (deferred writes flush at
+                       // the end of that update; tick 2 proves it stuck)
         assert_eq!(test.attack_target(enemy), Some(victim));
         let moved = test.position(enemy).unwrap();
         test.steps(20);
