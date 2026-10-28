@@ -491,7 +491,10 @@ fn attack_system(
     // Decide every strike for this tick first, then apply them in one pass.
     let mut pending_damage: Vec<(Entity, f32)> = Vec::new();
     let mut stale_orders: Vec<Entity> = Vec::new();
-    let mut strike_cooldowns: Vec<(Entity, f32)> = Vec::new();
+    // (entity, value, struck_this_tick). A unit that just attacked is set to
+    // its full cooldown; one that merely waited has the clock decayed by one
+    // step. The two cases must never be combined for the same entity.
+    let mut strike_cooldowns: Vec<(Entity, f32, bool)> = Vec::new();
     // Fighters that take damage this tick, merged per target so several
     // blows landing within one tick accumulate into a single in-place write.
     let mut fighter_damage: HashMap<Entity, f32> = HashMap::new();
@@ -511,29 +514,25 @@ fn attack_system(
         }
 
         let distance = target_distance(&rows, &fighter_rows, target, position);
-        // A freshly assigned order starts ready: treat a missing component as
-        // "0.0, ready to strike" instead of skipping this step.
-        let remaining = cooldown.unwrap_or(0.0);
-        let ready = remaining <= 0.0;
-        if !ready {
-            // The countdown clock must always advance by exactly one fixed
-            // step per tick — even while still walking toward the target —
-            // or an attacker that arrives out of phase with its cooldown
-            // would wait a full extra cycle before its first strike. Record
-            // the decayed value (deferred writes below tolerate entities
-            // whose order was dropped this tick).
-            let decayed = (remaining - dt).max(0.0);
-            strike_cooldowns.push((entity, decayed));
-        }
+        // The cooldown is a countdown clock: a missing component means the
+        // unit has never struck and is ready right now. Decay happens once,
+        // up front, regardless of range — an attacker walking toward its
+        // target must keep ticking every tick, or it would arrive out of
+        // phase with its own clock and wait a full extra cycle (or strike
+        // instantly) on arrival.
+        let remaining = cooldown.map(|clock| *clock - dt);
+        let ready = remaining.unwrap_or(0.0) <= 0.0;
         if distance > combat.range_for(kind) {
-            if cooldown.is_none() {
+            if let Some(decayed) = remaining {
+                strike_cooldowns.push((entity, decayed, false));
+            } else {
                 ensure_cooldown.push(entity);
             }
             continue;
         }
         if !ready {
-            // In range but still on cooldown: the decay above already
-            // recorded this tick's clock update.
+            // In range but still cooling down: record this tick's decay.
+            strike_cooldowns.push((entity, remaining.unwrap(), false));
             continue;
         }
 
@@ -546,15 +545,19 @@ fn attack_system(
         } else {
             pending_damage.push((target, amount));
         }
-        strike_cooldowns.push((entity, combat.cooldown_for(kind)));
+        strike_cooldowns.push((entity, combat.cooldown_for(kind), true));
     }
 
     // Units that hold an attack order always own their cooldown component
     // (every order assignment inserts one), so cooldown writes land directly
-    // on the fighter query; anything unexpected falls back to a deferred
-    // insert. Fighters whose order was removed this tick (stale targets) take
-    // their cooldown through the same deferred path instead, because applying
-    // structural edits mid-system is unsafe.
+    // on the fighter query. The bool flag distinguishes two cases: a unit
+    // that just attacked gets its full cooldown written even when the decay
+    // pass already recorded this tick's clock update, while a unit that
+    // merely waited has the decayed value written instead. Anything
+    // unexpected falls back to a deferred insert. Fighters whose order was
+    // removed this tick (stale targets) take their cooldown through the same
+    // deferred path instead, because applying structural edits mid-system is
+    // unsafe.
     let demoted: HashSet<Entity> = stale_orders.iter().copied().collect();
     for entity in &stale_orders {
         commands.entity(*entity).remove::<AttackOrder>();
@@ -576,11 +579,14 @@ fn attack_system(
     for entity in &ensure_cooldown {
         commands.entity(*entity).insert(AttackCooldown(0.0));
     }
-    for (entity, value) in strike_cooldowns {
+    for (entity, value, struck) in strike_cooldowns {
         if demoted.contains(&entity) {
             commands.entity(entity).insert(AttackCooldown(value));
         } else if let Ok((_, _, _, _, _, Some(mut cooldown), _)) = fighters.get_mut(entity) {
-            cooldown.0 = value;
+            // A unit that just attacked is set to its full cooldown no matter
+            // what the decay pass did this tick; one that merely waited has
+            // the decayed clock value.
+            cooldown.0 = if struck { value.max(0.0) } else { value };
         } else {
             commands.entity(entity).insert(AttackCooldown(value));
         }
