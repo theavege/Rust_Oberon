@@ -1076,13 +1076,20 @@ mod tests {
             .init_resource::<ShedPlacement>()
             .init_resource::<ShedDefinition>()
             .add_event::<PlayerCommand>()
-            // Mirror the production schedule exactly: commands and AI orders
-            // are issued from `Update` via events, deferred writes flush at
-            // the end of that update, and every resolution system runs on
-            // `FixedMain` — the same shape as `SimPlugin` in production,
-            // where `apply_player_commands` also consumes the event queue
-            // before the first fixed step of an update can see it.
-            .add_systems(Update, (apply_player_commands, opponent_ai_system))
+            // Mirror the production schedule's ordering intent: player
+            // commands and AI orders must take effect *before* the fixed
+            // step's movement/combat systems run within the same tick.
+            // Production achieves this by scheduling both appliers first on
+            // `FixedMain`. In the test app they run on `Update`, so their
+            // deferred writes flush at the end of that update — which is
+            // precisely when the next update begins, before its FixedMain
+            // systems run. The priming update absorbs the startup frame, so
+            // from then on every explicit `step()` is exactly one tick and
+            // every `send()` takes effect on the following tick.
+            .add_systems(
+                Update,
+                (apply_player_commands, opponent_ai_system.after(apply_player_commands)),
+            )
             .add_systems(
                 FixedMain,
                 (
@@ -1305,17 +1312,15 @@ mod tests {
         let target = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 10.0, false);
 
         test.send(PlayerCommand::Attack(target));
-        // The order attaches when the command's deferred writes flush, i.e.
-        // after the first `update()` completes — that same update also runs
-        // one fixed tick, which strikes immediately (fresh cooldowns start
-        // ready) because this target sits inside melee range. So: step 1 =
-        // order lands + first strike (100 -> 80), and the next 20 ticks are
-        // exactly one 1.0 s cooldown later than the strike that set it.
-        // Empirically (and by the code): the strike on update U sets the
-        // clock to 1.0; updates U+1 .. U+20 decay it to 0.0 without striking
-        // (the ready check sees the pre-decay value each of those ticks), and
-        // update U+21 finds the decayed clock at zero and strikes. So after
-        // 20 further updates there must still be exactly one hit.
+        // The order attaches when the command's deferred writes flush, at
+        // the end of the update that consumes the event — so the first
+        // strike happens on the *next* step, not the one the command was
+        // sent in. Step 1: order lands + first strike (100 -> 80, target
+        // sits inside melee range and fresh cooldowns start ready). The
+        // strike sets the clock to `cooldown - COOLDOWN_PHASE`; each later
+        // tick decays it by one step before the ready check, so exactly
+        // `cooldown / dt` ticks elapse between strikes: the second hit
+        // lands on step 21.
         test.steps(20);
         assert_eq!(test.health(target), Some(80.0));
         assert!(test.cooldown(attacker).is_some());
@@ -1324,8 +1329,7 @@ mod tests {
         test.steps(10);
         assert_eq!(test.health(target), Some(80.0), "cooldown gates strikes");
 
-        // One more tick takes the clock to zero and the decay-before-check
-        // rule makes that tick ready: the second hit lands here.
+        // One more tick takes the clock to zero: the second hit lands here.
         test.step();
         assert_eq!(test.health(target), Some(60.0));
     }
@@ -1340,9 +1344,9 @@ mod tests {
         let target = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 10.0, false);
 
         test.send(PlayerCommand::Attack(target));
-        // The order attaches when the first `update()` flushes deferred
-        // writes; that same update runs one fixed tick and strikes (fresh
-        // cooldowns start ready), so health is already 80 after step 1.
+        // The order attaches when the first `update()` after `send()`
+        // flushes deferred writes; that update's fixed tick strikes (fresh
+        // cooldowns start ready), so health is 80 after one step.
         test.step();
         assert_eq!(test.health(target), Some(80.0));
         test.steps(20); // one default (1 s) cooldown would have allowed a second hit
@@ -1351,9 +1355,11 @@ mod tests {
             Some(80.0),
             "scaled cooldown halves rate"
         );
-        // The doubled cooldown is 2 s = 40 ticks; the clock decays before the
-        // ready check, so the second strike lands on tick 41 after the first.
-        test.steps(21); // the doubled cooldown (2 s) now allows the second hit
+        // The doubled cooldown is 2 s = 40 ticks; the strike cadence is
+        // exactly `cooldown / dt` ticks, so the second hit lands on step 41.
+        test.steps(20); // still cooling down at 40 ticks after the first hit
+        assert_eq!(test.health(target), Some(80.0));
+        test.step(); // tick 41: the doubled cooldown (2 s) now allows the hit
         assert_eq!(test.health(target), Some(60.0));
     }
 
