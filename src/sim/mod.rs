@@ -716,6 +716,15 @@ fn attack_system(
     // (a `Ref`, not a system param), so read it once and cache it as a
     // resource; `SimPlugin::build` inserts the same constant up front.
     let dt = timestep.0;
+    // Half-step timing offset for cooldown clocks. The fixed-step driver runs
+    // `Time::tick` *before* the first `FixedMain` system of each tick, so a
+    // clock written by a strike in tick N is already decayed once (by the
+    // advance at the top of tick N+1) before that tick's decision pass reads
+    // it. Decay-before-check alone would therefore gate strikes to every
+    // ceil(cooldown / dt) + 1 ticks — one full step slower than the nominal
+    // cadence. Storing `cooldown - dt/2` centres the clock between two
+    // advances so exactly `cooldown / dt` ticks elapse between strikes.
+    const COOLDOWN_PHASE: f32 = SIM_STEP_SECONDS as f32 * 0.5;
     // Snapshot every unit up front: a lethal strike inside this same step
     // must not stop another attacker from also landing its blow, and the
     // damage pass below never re-reads state while a query is iterating.
@@ -824,7 +833,12 @@ fn attack_system(
         } else {
             pending_damage.push((target, amount));
         }
-        strike_cooldowns.push((entity, combat.cooldown_for(kind), true));
+        // See `COOLDOWN_PHASE`: the stored clock is offset by half a step so
+        // the next strike lands exactly one cooldown later, not one tick
+        // later. The ready check (`remaining <= 0`) is unaffected because the
+        // offset only shifts *when* the clock crosses zero relative to the
+        // driver's per-tick advance.
+        strike_cooldowns.push((entity, combat.cooldown_for(kind) - COOLDOWN_PHASE, true));
     }
 
     // Units that hold an attack order always own their cooldown component
