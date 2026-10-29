@@ -17,7 +17,6 @@ use crate::core::{
         Selected, ShedDefinition, ShedPlacement, Unit, UnitKind, WorldPosition,
     },
 };
-
 /// Nominal fixed timestep of the simulation, in seconds (20 Hz).
 pub const SIM_STEP_SECONDS: f64 = 0.05;
 
@@ -198,9 +197,7 @@ fn apply_player_commands(
                             &navigation,
                             position.0,
                             cells,
-                            other_units
-                                .iter()
-                                .filter(|other| other.0 != position.0),
+                            other_units.iter().filter(|other| other.0 != position.0),
                             range,
                             |grid, point| grid.world_to_cell(point),
                         );
@@ -992,10 +989,18 @@ fn opponent_ai_system(
             .filter(|(_, victim_player, _, health)| {
                 victim_player.0 != owner.0 && health.current > 0.0
             })
+            // Deterministic tie-break (see `target_preference_key`): nearest
+            // first, then earliest-spawned entity, so identical worlds always
+            // pick the same target regardless of query iteration order.
             .min_by(|a, b| {
-                a.2 .0
-                    .distance(position.0)
-                    .total_cmp(&b.2 .0.distance(position.0))
+                let key_a =
+                    crate::core::units::target_preference_key(a.2 .0.distance(position.0), a.0);
+                let key_b =
+                    crate::core::units::target_preference_key(b.2 .0.distance(position.0), b.0);
+                key_a
+                    .0
+                    .total_cmp(&key_b.0)
+                    .then_with(|| key_a.1.cmp(&key_b.1).then_with(|| key_a.2.cmp(&key_b.2)))
             })
             .map(|(target, _, target_position, _)| (target, *target_position))
         else {
@@ -1012,9 +1017,9 @@ fn opponent_ai_system(
                 &navigation,
                 position.0,
                 cells,
-                victims.iter().filter_map(|(_, _, other, _)| {
-                    (other.0 != position.0).then_some(other)
-                }),
+                victims
+                    .iter()
+                    .filter_map(|(_, _, other, _)| (other.0 != position.0).then_some(other)),
                 combat.range_for(unit.kind),
                 |grid, point| grid.world_to_cell(point),
             );
@@ -1106,7 +1111,10 @@ mod tests {
             // every `send()` takes effect on the following tick.
             .add_systems(
                 Update,
-                (apply_player_commands, opponent_ai_system.after(apply_player_commands)),
+                (
+                    apply_player_commands,
+                    opponent_ai_system.after(apply_player_commands),
+                ),
             )
             .add_systems(
                 FixedMain,
@@ -1498,6 +1506,21 @@ mod tests {
         assert_eq!(test.alive_count(), 1);
     }
 
+    #[test]
+    fn dbg_ai() {
+        let mut test = TestApp::new();
+        let victim = test.spawn_unit(UnitKind::Peasant, 0, Vec2::ZERO, false);
+        let enemy = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 380.0, false);
+        println!("victim={victim:?} enemy={enemy:?}");
+        let mut q = test.app.world().query::<(Entity, &crate::core::units::Player)>();
+        for (e, p) in q.iter(test.app.world()) {
+            println!("entity {e:?} player {p:?}");
+        }
+        for i in 0..4 {
+            test.step();
+            println!("step {i}: order={:?} pos={:?}", test.attack_target(enemy), test.position(enemy));
+        }
+    }
     #[test]
     fn opponent_ai_moves_into_range_of_far_targets() {
         let mut test = TestApp::new();

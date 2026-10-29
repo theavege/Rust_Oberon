@@ -104,6 +104,16 @@ pub struct AttackOrder {
 #[derive(Component, Debug)]
 pub struct Dead;
 
+/// Deterministic ordering key for combat targets: nearest first (world-space
+/// distance from the attacker), then lowest entity generation, then lowest
+/// index — i.e. earliest-spawned entity first. Shared by every order
+/// assignment path (`apply_player_commands` approach routing and
+/// `opponent_ai_system`) so ties resolve identically regardless of Bevy's
+/// query iteration order or spawn timing.
+pub fn target_preference_key(distance: f32, target: Entity) -> (f32, u32, u32) {
+    (distance, target.generation(), target.index())
+}
+
 /// Grid route generated for the unit's current movement order.
 #[derive(Component, Debug, Default)]
 pub struct MovePath(pub VecDeque<IVec2>);
