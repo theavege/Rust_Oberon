@@ -1064,12 +1064,24 @@ mod tests {
         // is *set* to exactly one timestep per update through
         // `ManualDuration` below — never merely accumulated on top of the
         // real elapsed time.
+        //
+        // The fixed-step driver must also be enabled explicitly: with
+        // `MinimalPlugins` the `FixedMain` schedule is disabled until a
+        // `run_schedule_independent` system or an explicit enablement turns
+        // it on, and `app.update()` would then run *zero* fixed ticks —
+        // freezing movement, combat and death systems in tests.
         app.add_plugins(MinimalPlugins)
             .insert_resource(Time::<Virtual>::default())
             .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
                 SIM_STEP_SECONDS,
             )))
-            .insert_resource(SimTimestep(SIM_STEP_SECONDS as f32))
+            .enable_time_scale()
+            .world_mut()
+            .resource_mut::<Time<Fixed>>()
+            .set_update_strategy(FixedUpdateStrategy::ManualDuration(Duration::from_secs_f64(
+                SIM_STEP_SECONDS,
+            )));
+        app.insert_resource(SimTimestep(SIM_STEP_SECONDS as f32))
             .insert_resource(open_grid())
             .insert_resource(combat)
             .init_resource::<PlayerEconomy>()
