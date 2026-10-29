@@ -17,7 +17,6 @@ use crate::core::{
         Selected, ShedDefinition, ShedPlacement, Unit, UnitKind, WorldPosition,
     },
 };
-
 /// Nominal fixed timestep of the simulation, in seconds (20 Hz).
 pub const SIM_STEP_SECONDS: f64 = 0.05;
 
@@ -992,10 +991,18 @@ fn opponent_ai_system(
             .filter(|(_, victim_player, _, health)| {
                 victim_player.0 != owner.0 && health.current > 0.0
             })
+            // Deterministic tie-break (see `target_preference_key`): nearest
+            // first, then earliest-spawned entity, so identical worlds always
+            // pick the same target regardless of query iteration order.
             .min_by(|a, b| {
-                a.2 .0
-                    .distance(position.0)
-                    .total_cmp(&b.2 .0.distance(position.0))
+                crate::core::units::target_preference_key(
+                    a.2 .0.distance(position.0),
+                    a.0,
+                )
+                .total_cmp(&crate::core::units::target_preference_key(
+                    b.2 .0.distance(position.0),
+                    b.0,
+                ))
             })
             .map(|(target, _, target_position, _)| (target, *target_position))
         else {
