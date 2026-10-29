@@ -1036,7 +1036,12 @@ fn opponent_ai_system(
 mod tests {
     use super::*;
     use crate::core::units::KindCombat;
-    use bevy::time::Virtual;
+
+    /// No-op marker system whose only purpose is to register something on the
+    /// `FixedMain` schedule in the test app, which enables Bevy's fixed-step
+    /// catch-up loop (`RunFixedMainLoop`). Without any system on `FixedMain`,
+    /// `MinimalPlugins` would run zero fixed ticks per update.
+    fn enable_fixed_step() {}
 
     /// Nominal fixed-timestep duration in seconds. The virtual clock is
     /// advanced by exactly this amount per `step()`, so every call runs one
@@ -1074,13 +1079,14 @@ mod tests {
             .insert_resource(Time::<Virtual>::default())
             .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
                 SIM_STEP_SECONDS,
-            )))
-            .enable_time_scale()
-            .world_mut()
-            .resource_mut::<Time<Fixed>>()
-            .set_update_strategy(FixedUpdateStrategy::ManualDuration(Duration::from_secs_f64(
-                SIM_STEP_SECONDS,
             )));
+        // The fixed-step driver itself must be enabled explicitly: with
+        // `MinimalPlugins` the `FixedMain` schedule never runs until a
+        // system is registered on it, which would freeze movement, combat
+        // and death systems in tests. Registering the (no-op) enablement
+        // marker on `FixedMain` turns the catch-up loop on; the timestep is
+        // pinned to `DT` below so no accumulator drift builds up.
+        app.add_systems(FixedMain, enable_fixed_step);
         app.insert_resource(SimTimestep(SIM_STEP_SECONDS as f32))
             .insert_resource(open_grid())
             .insert_resource(combat)
