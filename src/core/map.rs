@@ -19,6 +19,16 @@ pub struct NavigationGrid {
 }
 
 impl NavigationGrid {
+    /// Fully walkable grid of `size` x `size` cells (no reserved footprints).
+    /// Used by simulation tests that need pathing without a real map file.
+    pub fn open_field(size: u32) -> Self {
+        Self {
+            width: size,
+            height: size,
+            walkable: vec![true; (size * size) as usize],
+            reserved: vec![false; (size * size) as usize],
+        }
+    }
     /// Build walkability from the scheme's Earth surface. Sea, unmoveable and
     /// non-existent terrain types block units; other Earth terrain is usable.
     pub fn from_map(map: &MapFile, scheme: &Scheme) -> Self {
@@ -75,7 +85,7 @@ impl NavigationGrid {
         true
     }
 
-    fn cell_index(&self, cell: IVec2) -> usize {
+    pub(crate) fn cell_index(&self, cell: IVec2) -> usize {
         (cell.y as u32 * self.width + cell.x as u32) as usize
     }
 
@@ -93,6 +103,28 @@ impl NavigationGrid {
             16.0 * (cell.x - cell.y) as f32,
             -8.0 * (cell.x + cell.y) as f32 - 8.0,
         )
+    }
+
+    /// Closest walkable cell to `requested` within `radius` cells (Chebyshev
+    /// distance), searched by increasing ring distance so the first hit is the
+    /// nearest one. Used by attack approaches that must stop *near* a target
+    /// instead of walking onto it.
+    pub fn nearest_walkable_in(&self, requested: IVec2, radius: i32) -> Option<IVec2> {
+        for r in 0..=radius.max(0) {
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    // Only visit cells on this ring's border.
+                    if dx.abs() != r && dy.abs() != r {
+                        continue;
+                    }
+                    let cell = requested + IVec2::new(dx, dy);
+                    if self.is_walkable(cell) {
+                        return Some(cell);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Find a nearby walkable cell for clicks on water or impassable terrain.
