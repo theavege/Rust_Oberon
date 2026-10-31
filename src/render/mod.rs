@@ -17,6 +17,8 @@ impl Plugin for RenderPlugin {
                 Update,
                 (
                     camera::camera_pan,
+                    units_view::save_load_input,
+                    units_view::sync_save_status,
                     units_view::unit_input,
                     units_view::shed_placement_input,
                     units_view::sync_shed_placement_preview,
@@ -28,9 +30,23 @@ impl Plugin for RenderPlugin {
                     units_view::sync_resource_transforms,
                     units_view::sync_unit_sprites,
                     units_view::sync_unit_transforms,
+                ),
+            )
+            .add_systems(
+                Update,
+                (
                     units_view::sync_fog_visibility,
+                    units_view::sync_role_labels.after(units_view::sync_fog_visibility),
+                    units_view::sync_health_bars.after(units_view::sync_fog_visibility),
+                    units_view::spawn_combat_text,
+                    units_view::animate_combat_text,
                     units_view::show_selection,
                     units_view::show_health,
+                ),
+            )
+            .add_systems(
+                Update,
+                (
                     units_view::spawn_death_flashes,
                     units_view::fade_death_flashes,
                     units_view::sync_economy_hud,

@@ -64,6 +64,19 @@ impl VisibilityGrid {
         self.visible.fill(false);
     }
 
+    pub fn explored_cells(&self) -> &[bool] {
+        &self.explored
+    }
+
+    pub fn restore_explored(&mut self, cells: &[bool]) -> bool {
+        if cells.len() != self.explored.len() {
+            return false;
+        }
+        self.explored.copy_from_slice(cells);
+        self.clear_visible();
+        true
+    }
+
     pub fn reveal(&mut self, center: IVec2, radius: i32) {
         for y in (center.y - radius)..=(center.y + radius) {
             for x in (center.x - radius)..=(center.x + radius) {
@@ -90,6 +103,10 @@ impl NavigationGrid {
             walkable: vec![true; (size * size) as usize],
             reserved: vec![false; (size * size) as usize],
         }
+    }
+
+    pub fn clear_reservations(&mut self) {
+        self.reserved.fill(false);
     }
     /// Build walkability from the scheme's Earth surface. Sea, unmoveable and
     /// non-existent terrain types block units; other Earth terrain is usable.

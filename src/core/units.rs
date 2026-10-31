@@ -11,6 +11,14 @@ pub enum UnitKind {
 }
 
 impl UnitKind {
+    pub fn role_label(self) -> &'static str {
+        match self {
+            UnitKind::Peasant => "Worker",
+            UnitKind::Warrior => "Melee",
+            UnitKind::Archer => "Ranged",
+        }
+    }
+
     pub fn speed(self) -> f32 {
         match self {
             UnitKind::Peasant => 2.0,

@@ -1,7 +1,7 @@
 //! Top-down 2D camera with WASD pan and mouse-edge scroll hooks (later).
 
 use crate::core::gamestate::GameState;
-use crate::render::units_view::EconomyHud;
+use crate::render::units_view::{EconomyHud, SaveStatusHud};
 use bevy::prelude::*;
 use bevy::render::camera::ScalingMode;
 use bevy::sprite::Anchor;
@@ -35,6 +35,17 @@ pub fn spawn_camera(mut commands: Commands, game: Option<Res<GameState>>) {
             Anchor::TopLeft,
             Transform::from_xyz(-760.0, 420.0, -998.0),
             EconomyHud,
+        ));
+        parent.spawn((
+            Text2d::new("F5 Save | F9 Load"),
+            TextFont {
+                font_size: 18.0,
+                ..default()
+            },
+            TextColor(Color::srgb(0.8, 0.85, 0.9)),
+            Anchor::TopLeft,
+            Transform::from_xyz(-760.0, 385.0, -998.0),
+            SaveStatusHud,
         ));
     });
 }

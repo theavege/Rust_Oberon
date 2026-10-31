@@ -3112,6 +3112,8 @@ name = "rust_oberon"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "ron",
+ "serde",
 ]
 
 [[package]]

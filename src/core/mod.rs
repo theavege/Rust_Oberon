@@ -5,8 +5,10 @@ pub mod datamanifest;
 pub mod gamestate;
 pub mod map;
 pub mod mapfile;
+pub mod save;
 pub mod scheme;
 pub mod units;
+pub mod validate;
 
 use bevy::prelude::*;
 
@@ -39,6 +41,6 @@ impl Plugin for CorePlugin {
             .init_resource::<units::ShedDefinition>()
             .init_resource::<units::CombatDefinition>()
             .init_resource::<units::ShedPlacement>()
-            .add_plugins(gamestate::DataPlugin);
+            .add_plugins((gamestate::DataPlugin, save::SavePlugin));
     }
 }

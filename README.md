@@ -17,8 +17,8 @@ Rust Oberon is an open-source real-time strategy game written in Rust, inspired 
 1. **Playable movement slice (complete)** — load an original map and terrain art; show a controllable camera and a small player squad; select a unit and issue a move order. Done when the game opens into a legible map, WASD/arrows pan the view, left-click selects a unit, and right-click sends it toward the destination.
 2. **Simulation foundation (complete)** — represent positions and orders in a fixed-step simulation; derive walkability from the map's Earth layer; route units around blocked terrain with A*; keep simulation state separate from sprites.
 3. **First RTS loop (complete)** — add one resource and harvesting, then one buildable structure and construction placement. Keep the map and gameplay definitions data-driven; add a basic enemy opponent after the loop is playable.
-4. **Core combat and visibility (in progress)** — attack/health/death and a basic enemy opponent are implemented. Add fog of war and improve combat feedback before expanding unit roles.
-5. **Persistence and content tools** — add save/load, map/content validation, error reporting and contributor workflows for maps and definitions.
+4. **Core combat and visibility (complete)** — attack/health/death, distinct unit roles, basic fog of war and combat feedback are implemented.
+5. **Persistence and content tools (in progress)** — save/load is implemented; add map/content validation, error reporting and contributor workflows for maps and definitions.
 6. **Polish and release** — improve input/UI/audio, performance on larger battles, packaging, documentation, accessibility and release/license notices.
 
 ### Shed construction slice (complete)
@@ -41,9 +41,27 @@ The simulation tracks current vision and persistent exploration for the human pl
 
 This first pass uses fragment anchor cells to shade terrain and has a single visibility grid for the current one-human-player game. Add line-of-sight blockers and per-player visibility when the game supports multiple human players.
 
-### Next step: combat feedback
+### Combat feedback (implemented)
 
-Improve combat readability with visible health bars, attack feedback and clearer unit roles. Keep combat resolution in the fixed-step simulation and presentation in `render/`; add or extend simulation coverage for any changed combat rules.
+Units display health bars and role labels; successful hits show short floating damage numbers. Role colors remain distinct, while simulation-owned combat rules and fog visibility determine the presentation.
+
+### Save/load foundation (implemented)
+
+Press **F5** to write `saves/latest.ron`, or **F9** to load it. The versioned snapshot records map identity, player wood, unit kind/owner/position/health, remaining wood nodes, building footprints and construction progress, plus explored fog. Loading validates version, map, bounds, entity data and building overlap before replacing the live simulation. Save data round-trip, invalid entities and unsupported versions are covered.
+
+Movement and attack orders are not persisted yet; units resume idle after loading. Saves are local to the working directory.
+
+### Content validation command (implemented)
+
+Run `cargo run -- --validate-content` to validate every bundled `.map`, `.sch`, the texture manifest and referenced texture files. The command checks map dimensions, start points, scheme references, fragment/surface bounds and texture paths. Failures include the source path and a line number; pass a custom asset root as the second argument when validating another content pack.
+
+### Runtime load validation (implemented)
+
+`GameState::load` runs the same content validators before parsing and returning a map. Startup inserts the loaded state only after validation succeeds, so invalid content cannot partially replace the live world.
+
+### Next step: campaign load integration
+
+When campaign transitions are added, route each map change through `GameState::load` and preserve the current game until the replacement map has passed validation and loaded successfully.
 
 ### Tooling: lint and format
 
@@ -77,7 +95,7 @@ Requires Rust and Cargo. From the repository root:
 cargo run
 ```
 
-Controls: **WASD / arrow keys** to pan, **left-click** a unit to select (empty ground clears selection), **right-click** open ground to move, and **right-click** a tree with a Peasant selected to harvest wood. Press **B** to place a Shed; **left-click** a valid site, or cancel with **Escape** / right-click.
+Controls: **WASD / arrow keys** to pan, **left-click** a unit to select (empty ground clears selection), **right-click** open ground to move, and **right-click** a tree with a Peasant selected to harvest wood. Press **B** to place a Shed; **left-click** a valid site, or cancel with **Escape** / right-click. **F5** saves and **F9** loads the local save.
 
 ## Architecture
 

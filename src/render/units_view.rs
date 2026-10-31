@@ -1,9 +1,12 @@
 //! Project simulation-owned unit positions and selection state into visuals.
 
+use std::collections::{HashMap, HashSet};
+
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
 
 use crate::core::map::{NavigationGrid, VisibilityGrid};
+use crate::core::save::{SaveRequest, SaveStatus};
 use crate::core::units::{
     Building, ConstructionSite, Dead, Health, Player, PlayerCommand, PlayerEconomy, ResourceNode,
     Selected, ShedDefinition, ShedPlacement, Unit, UnitKind, WorldPosition,
@@ -12,6 +15,20 @@ use crate::core::units::{
 /// Marker for unit visuals so we can find unsynced entities.
 #[derive(Component)]
 pub struct UnitSprite;
+
+#[derive(Component)]
+pub struct UnitRoleLabel(Entity);
+
+#[derive(Component)]
+pub struct UnitHealthBar {
+    unit: Entity,
+    fill: bool,
+}
+
+#[derive(Component)]
+pub struct CombatText {
+    remaining: f32,
+}
 
 pub fn unit_input(
     buttons: Res<ButtonInput<MouseButton>>,
@@ -200,6 +217,32 @@ pub struct ResourceNodeSprite;
 pub struct EconomyHud;
 
 #[derive(Component)]
+pub struct SaveStatusHud;
+
+pub fn save_load_input(keys: Res<ButtonInput<KeyCode>>, mut requests: EventWriter<SaveRequest>) {
+    if keys.just_pressed(KeyCode::F5) {
+        requests.write(SaveRequest::Save);
+    }
+    if keys.just_pressed(KeyCode::F9) {
+        requests.write(SaveRequest::Load);
+    }
+}
+
+pub fn sync_save_status(
+    status: Res<SaveStatus>,
+    mut labels: Query<&mut Text2d, With<SaveStatusHud>>,
+    mut last_revision: Local<u64>,
+) {
+    if *last_revision == status.revision {
+        return;
+    }
+    *last_revision = status.revision;
+    for mut text in &mut labels {
+        text.0 = status.message.clone();
+    }
+}
+
+#[derive(Component)]
 pub struct BuildingSprite {
     frame: usize,
     completed: bool,
@@ -358,6 +401,143 @@ pub fn sync_unit_sprites(
             HealthBarBase(base),
             Transform::from_xyz(position.0.x, position.0.y, 1.0),
         ));
+        commands.spawn((
+            Text2d::new(unit.kind.role_label()),
+            TextFont {
+                font_size: 11.0,
+                ..default()
+            },
+            TextColor(Color::WHITE),
+            Anchor::Center,
+            Transform::from_xyz(position.0.x, position.0.y + 37.0, 1.8),
+            UnitRoleLabel(entity),
+        ));
+    }
+}
+
+pub fn sync_role_labels(
+    mut commands: Commands,
+    units: Query<(&WorldPosition, Option<&Visibility>), With<Unit>>,
+    mut labels: Query<
+        (Entity, &UnitRoleLabel, &mut Transform, &mut Visibility),
+        (With<UnitRoleLabel>, Without<Unit>),
+    >,
+) {
+    for (label_entity, label, mut transform, mut visibility) in &mut labels {
+        let Ok((position, unit_visibility)) = units.get(label.0) else {
+            commands.entity(label_entity).despawn();
+            continue;
+        };
+        transform.translation.x = position.0.x;
+        transform.translation.y = position.0.y + 37.0;
+        *visibility = unit_visibility.copied().unwrap_or(Visibility::Inherited);
+    }
+}
+
+/// Spawn a simple dark-backed health bar for each unit and keep it above the
+/// simulation-owned position. It inherits the unit's fog visibility.
+pub fn sync_health_bars(
+    mut commands: Commands,
+    units: Query<(Entity, &WorldPosition, &Health, Option<&Visibility>), With<Unit>>,
+    mut bars: Query<
+        (
+            Entity,
+            &UnitHealthBar,
+            &mut Sprite,
+            &mut Transform,
+            &mut Visibility,
+        ),
+        (With<UnitHealthBar>, Without<Unit>),
+    >,
+) {
+    let mut existing = HashSet::new();
+    for (entity, bar, mut sprite, mut transform, mut display) in &mut bars {
+        let Ok((_, position, health, unit_visibility)) = units.get(bar.unit) else {
+            commands.entity(entity).despawn();
+            continue;
+        };
+        existing.insert((bar.unit, bar.fill));
+        let ratio = (health.current / health.max).clamp(0.0, 1.0);
+        let (width, color, left_offset) = if bar.fill {
+            (34.0 * ratio, Color::srgb(0.25, 0.92, 0.32), 1.0)
+        } else {
+            (36.0, Color::srgb(0.08, 0.08, 0.08), 0.0)
+        };
+        sprite.custom_size = Some(Vec2::new(width.max(0.01), 4.0));
+        sprite.anchor = Anchor::CenterLeft;
+        sprite.color = color;
+        transform.translation.x = position.0.x - 18.0 + left_offset;
+        transform.translation.y = position.0.y + 23.0;
+        *display = unit_visibility.copied().unwrap_or(Visibility::Inherited);
+    }
+
+    for (unit, position, _, _) in &units {
+        for fill in [false, true] {
+            if existing.contains(&(unit, fill)) {
+                continue;
+            }
+            commands.spawn((
+                Sprite {
+                    color: if fill {
+                        Color::srgb(0.25, 0.92, 0.32)
+                    } else {
+                        Color::srgb(0.08, 0.08, 0.08)
+                    },
+                    custom_size: Some(Vec2::new(if fill { 34.0 } else { 36.0 }, 4.0)),
+                    anchor: Anchor::CenterLeft,
+                    ..default()
+                },
+                Transform::from_xyz(position.0.x - 18.0, position.0.y + 23.0, 1.7),
+                Visibility::Inherited,
+                UnitHealthBar { unit, fill },
+            ));
+        }
+    }
+}
+
+/// Detect new damage in the presentation and float a brief damage number over
+/// the victim. Combat remains resolved solely by the fixed-step simulation.
+pub fn spawn_combat_text(
+    mut commands: Commands,
+    units: Query<(Entity, &Health, &WorldPosition), With<Unit>>,
+    mut previous_health: Local<HashMap<Entity, f32>>,
+) {
+    let mut alive = HashSet::new();
+    for (entity, health, position) in &units {
+        alive.insert(entity);
+        if let Some(previous) = previous_health.insert(entity, health.current) {
+            let damage = previous - health.current;
+            if damage > 0.0 {
+                commands.spawn((
+                    Text2d::new(format!("-{}", damage.round() as u32)),
+                    TextFont {
+                        font_size: 16.0,
+                        ..default()
+                    },
+                    TextColor(Color::srgb(1.0, 0.72, 0.35)),
+                    Anchor::Center,
+                    Transform::from_xyz(position.0.x, position.0.y + 25.0, 2.0),
+                    CombatText { remaining: 0.75 },
+                ));
+            }
+        }
+    }
+    previous_health.retain(|entity, _| alive.contains(entity));
+}
+
+pub fn animate_combat_text(
+    time: Res<Time>,
+    mut commands: Commands,
+    mut texts: Query<(Entity, &mut CombatText, &mut Transform, &mut TextColor)>,
+) {
+    for (entity, mut text, mut transform, mut color) in &mut texts {
+        text.remaining -= time.delta_secs();
+        transform.translation.y += time.delta_secs() * 20.0;
+        let alpha = (text.remaining / 0.75).clamp(0.0, 1.0);
+        color.0 = Color::srgba(1.0, 0.72, 0.35, alpha);
+        if text.remaining <= 0.0 {
+            commands.entity(entity).despawn();
+        }
     }
 }
 

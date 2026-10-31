@@ -6,8 +6,28 @@ mod render;
 mod sim;
 
 use bevy::prelude::*;
+use std::path::PathBuf;
 
 fn main() {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("--validate-content") {
+        let root = args
+            .next()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/do"));
+        match core::validate::validate_content(&root) {
+            Ok(count) => println!("Content validation passed: {count} maps and schemes checked."),
+            Err(errors) => {
+                for error in &errors {
+                    eprintln!("{error}");
+                }
+                eprintln!("Content validation failed with {} error(s).", errors.len());
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {

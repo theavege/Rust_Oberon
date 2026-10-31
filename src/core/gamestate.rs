@@ -49,6 +49,13 @@ fn find_assets_dir() -> Option<PathBuf> {
 
 impl GameState {
     pub fn load(do_root: &Path, map_name: &str) -> Result<Self, String> {
+        crate::core::validate::validate_content(do_root).map_err(|errors| {
+            format!(
+                "content validation failed before loading '{map_name}':\n{}",
+                errors.join("\n")
+            )
+        })?;
+
         let disk_asset_dir = do_root.join("scheme_plastic");
         let manifest_src = std::fs::read_to_string(disk_asset_dir.join("manifest.json"))
             .map_err(|e| format!("manifest: {e}"))?;
@@ -117,6 +124,19 @@ impl GameState {
             (CELL_W / 2.0) * (x as f32 - y as f32),
             -(CELL_H / 2.0) * (x as f32 + y as f32),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_map_load_uses_content_validation() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/do");
+        let game = GameState::load(&root, "trial").expect("validated Trial map loads");
+        assert_eq!(game.map.width, 80);
+        assert_eq!(game.map.height, 80);
     }
 }
 
