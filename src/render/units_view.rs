@@ -3,7 +3,7 @@
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
 
-use crate::core::map::NavigationGrid;
+use crate::core::map::{NavigationGrid, VisibilityGrid};
 use crate::core::units::{
     Building, ConstructionSite, Dead, Health, Player, PlayerCommand, PlayerEconomy, ResourceNode,
     Selected, ShedDefinition, ShedPlacement, Unit, UnitKind, WorldPosition,
@@ -18,8 +18,10 @@ pub fn unit_input(
     windows: Query<&Window>,
     cameras: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
     mut commands: EventWriter<PlayerCommand>,
-    units: Query<(Entity, &Transform, Option<&Player>), With<Unit>>,
-    resource_nodes: Query<(Entity, &Transform), With<ResourceNode>>,
+    units: Query<(Entity, &Transform, Option<&Player>, Option<&Visibility>), With<Unit>>,
+    resource_nodes: Query<(Entity, &Transform, Option<&Visibility>), With<ResourceNode>>,
+    navigation: Res<NavigationGrid>,
+    visibility: Res<VisibilityGrid>,
 ) {
     let Ok(window) = windows.single() else { return };
     let Some(cursor) = window.cursor_position() else {
@@ -35,12 +37,20 @@ pub fn unit_input(
     if buttons.just_pressed(MouseButton::Left) {
         let target = units
             .iter()
-            .map(|(entity, transform, _)| {
-                (entity, transform.translation.truncate().distance(world_pos))
+            .map(|(entity, transform, player, shown)| {
+                let owner = player.map(|p| p.0);
+                let cell = navigation.world_to_cell(transform.translation.truncate());
+                let selectable = owner == Some(0) || visibility.is_visible(cell);
+                (
+                    entity,
+                    transform.translation.truncate().distance(world_pos),
+                    selectable,
+                    shown.is_none_or(|v| *v != Visibility::Hidden),
+                )
             })
-            .filter(|(_, distance)| *distance <= 22.0)
+            .filter(|(_, distance, selectable, shown)| *distance <= 22.0 && *selectable && *shown)
             .min_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(entity, _)| entity);
+            .map(|(entity, _, _, _)| entity);
         commands.write(PlayerCommand::Select(target));
     }
     if buttons.just_pressed(MouseButton::Right) {
@@ -48,16 +58,19 @@ pub fn unit_input(
         // node it harvests; otherwise it moves.
         let clicked_unit = units
             .iter()
-            .map(|(entity, transform, owner)| {
+            .map(|(entity, transform, owner, shown)| {
+                let cell = navigation.world_to_cell(transform.translation.truncate());
                 (
                     entity,
                     owner.map(|player| player.0),
                     transform.translation.truncate().distance(world_pos),
+                    owner.is_some_and(|p| p.0 == 0) || visibility.is_visible(cell),
+                    shown.is_none_or(|v| *v != Visibility::Hidden),
                 )
             })
-            .filter(|(_, _, distance)| *distance <= 22.0)
+            .filter(|(_, _, distance, seen, shown)| *distance <= 22.0 && *seen && *shown)
             .min_by(|a, b| a.2.total_cmp(&b.2));
-        if let Some((entity, Some(owner), _)) = clicked_unit {
+        if let Some((entity, Some(owner), _, _, _)) = clicked_unit {
             if owner != 0 {
                 commands.write(PlayerCommand::Attack(entity));
                 return;
@@ -65,12 +78,16 @@ pub fn unit_input(
         }
         let resource = resource_nodes
             .iter()
-            .map(|(entity, transform)| {
-                (entity, transform.translation.truncate().distance(world_pos))
+            .map(|(entity, transform, shown)| {
+                (
+                    entity,
+                    transform.translation.truncate().distance(world_pos),
+                    shown.is_none_or(|v| *v != Visibility::Hidden),
+                )
             })
-            .filter(|(_, distance)| *distance <= 52.0)
+            .filter(|(_, distance, shown)| *distance <= 52.0 && *shown)
             .min_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(entity, _)| entity);
+            .map(|(entity, _, _)| entity);
         if let Some(resource) = resource {
             commands.write(PlayerCommand::Harvest(resource));
         } else {
@@ -399,6 +416,35 @@ pub fn sync_unit_transforms(mut q: Query<(&WorldPosition, &mut Transform), With<
     for (position, mut transform) in &mut q {
         transform.translation.x = position.0.x;
         transform.translation.y = position.0.y;
+    }
+}
+
+/// Conceal enemies and neutral resource nodes outside the player's current
+/// sight. Player-owned units/buildings remain visible to their owner.
+pub fn sync_fog_visibility(
+    navigation: Res<NavigationGrid>,
+    visibility: Res<VisibilityGrid>,
+    mut entities: Query<
+        (
+            &WorldPosition,
+            &mut Visibility,
+            Option<&Player>,
+            Option<&Building>,
+            Option<&ResourceNode>,
+        ),
+        Or<(With<Unit>, With<Building>, With<ResourceNode>)>,
+    >,
+) {
+    for (position, mut display, owner, building, resource) in &mut entities {
+        let owner_id = owner.map(|p| p.0).or_else(|| building.map(|b| b.owner));
+        let cell = navigation.world_to_cell(position.0);
+        let seen =
+            (owner_id.is_some() || resource.is_some()) && visibility.entity_visible(owner_id, cell);
+        *display = if seen {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
     }
 }
 

@@ -16,8 +16,8 @@ Rust Oberon is an open-source real-time strategy game written in Rust, inspired 
 
 1. **Playable movement slice (complete)** — load an original map and terrain art; show a controllable camera and a small player squad; select a unit and issue a move order. Done when the game opens into a legible map, WASD/arrows pan the view, left-click selects a unit, and right-click sends it toward the destination.
 2. **Simulation foundation (complete)** — represent positions and orders in a fixed-step simulation; derive walkability from the map's Earth layer; route units around blocked terrain with A*; keep simulation state separate from sprites.
-3. **First RTS loop (in progress)** — add one resource and harvesting, then one buildable structure and construction placement. Keep the map and gameplay definitions data-driven; add a basic enemy opponent after the loop is playable.
-4. **Core combat and visibility** — add attack/health/death, unit roles, fog of war and a useful combat feedback loop.
+3. **First RTS loop (complete)** — add one resource and harvesting, then one buildable structure and construction placement. Keep the map and gameplay definitions data-driven; add a basic enemy opponent after the loop is playable.
+4. **Core combat and visibility (in progress)** — attack/health/death and a basic enemy opponent are implemented. Add fog of war and improve combat feedback before expanding unit roles.
 5. **Persistence and content tools** — add save/load, map/content validation, error reporting and contributor workflows for maps and definitions.
 6. **Polish and release** — improve input/UI/audio, performance on larger battles, packaging, documentation, accessibility and release/license notices.
 
@@ -25,17 +25,25 @@ Rust Oberon is an open-source real-time strategy game written in Rust, inspired 
 
 Press **B** to place a Shed using harvested wood. The grid-snapped preview is green on a valid site and red otherwise; left-click places it, while **Escape** or right-click cancels. Placement checks the full footprint against map bounds, terrain, other buildings and units. The footprint is reserved for navigation immediately, construction progress is visible, and the completed Shed uses the original idle sprite. Invalid sites and insufficient wood cannot spend resources. Footprint, wood cost and construction duration are set by `ShedDefinition`.
 
-### Next step: combat foundations
+### Combat foundations (complete)
 
-Build a small, testable combat slice before adding an enemy opponent:
+The first combat slice is implemented and covered by simulation tests:
 
-1. Add data-driven damage, range and attack cooldown values for unit kinds.
-2. Add an attack command and target handling. Units move into range, attack on cooldown, and stop when the target is dead or invalid.
-3. Apply damage and remove units at zero health in the fixed-step simulation, independently of rendering.
-4. Add clear visual feedback for health and death.
-5. Test attack range, cooldown, damage, death and cancelled or invalid targets.
+1. `CombatDefinition` provides damage, range and cooldown values with per-kind overrides.
+2. Attack orders route units into range and resolve attacks on fixed-step cooldowns.
+3. Simulation applies damage, rejects invalid targets and removes units at zero health.
+4. The view communicates ownership, health loss, selection and death.
+5. A basic opponent attacks nearby player units and buildings.
 
-Done when a player unit can attack an enemy, the enemy takes damage and is removed at zero health, and simulation tests cover those rules. Then add a basic opponent that can attack back.
+### Fog of war foundation (implemented)
+
+The simulation tracks current vision and persistent exploration for the human player. Each friendly unit reveals a circular radius of eight map cells; vision updates on the fixed simulation tick. Terrain fragments are darkened when explored and blacked out when unexplored, while enemy units, buildings and resource nodes are hidden outside current vision. Rendering and click handling read the visibility state without changing simulation positions.
+
+This first pass uses fragment anchor cells to shade terrain and has a single visibility grid for the current one-human-player game. Add line-of-sight blockers and per-player visibility when the game supports multiple human players.
+
+### Next step: combat feedback
+
+Improve combat readability with visible health bars, attack feedback and clearer unit roles. Keep combat resolution in the fixed-step simulation and presentation in `render/`; add or extend simulation coverage for any changed combat rules.
 
 ### Tooling: lint and format
 

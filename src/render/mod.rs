@@ -28,6 +28,7 @@ impl Plugin for RenderPlugin {
                     units_view::sync_resource_transforms,
                     units_view::sync_unit_sprites,
                     units_view::sync_unit_transforms,
+                    units_view::sync_fog_visibility,
                     units_view::show_selection,
                     units_view::show_health,
                     units_view::spawn_death_flashes,

@@ -18,6 +18,68 @@ pub struct NavigationGrid {
     reserved: Vec<bool>,
 }
 
+/// Player 0's fog of war. `visible` is recomputed from current scouts;
+/// `explored` persists for the lifetime of the match.
+#[derive(Resource, Debug, Clone, Default)]
+pub struct VisibilityGrid {
+    pub width: u32,
+    pub height: u32,
+    visible: Vec<bool>,
+    explored: Vec<bool>,
+}
+
+impl VisibilityGrid {
+    pub fn from_navigation(grid: &NavigationGrid) -> Self {
+        let count = (grid.width * grid.height) as usize;
+        Self {
+            width: grid.width,
+            height: grid.height,
+            visible: vec![false; count],
+            explored: vec![false; count],
+        }
+    }
+
+    pub fn is_visible(&self, cell: IVec2) -> bool {
+        self.cell(cell).is_some_and(|i| self.visible[i])
+    }
+
+    pub fn is_explored(&self, cell: IVec2) -> bool {
+        self.cell(cell).is_some_and(|i| self.explored[i])
+    }
+
+    /// Friendly entities are always visible; enemies and neutral resources
+    /// require current vision. `None` represents a neutral entity.
+    pub fn entity_visible(&self, owner: Option<u8>, cell: IVec2) -> bool {
+        owner == Some(0) || self.is_visible(cell)
+    }
+
+    fn cell(&self, cell: IVec2) -> Option<usize> {
+        if cell.x < 0 || cell.y < 0 || cell.x >= self.width as i32 || cell.y >= self.height as i32 {
+            return None;
+        }
+        Some((cell.y as u32 * self.width + cell.x as u32) as usize)
+    }
+
+    pub fn clear_visible(&mut self) {
+        self.visible.fill(false);
+    }
+
+    pub fn reveal(&mut self, center: IVec2, radius: i32) {
+        for y in (center.y - radius)..=(center.y + radius) {
+            for x in (center.x - radius)..=(center.x + radius) {
+                let cell = IVec2::new(x, y);
+                if (x - center.x).pow(2) + (y - center.y).pow(2) > radius.pow(2) {
+                    continue;
+                }
+                if let Some(index) = self.cell(cell) {
+                    self.visible[index] = true;
+                    self.explored[index] = true;
+                }
+            }
+        }
+    }
+}
+
 impl NavigationGrid {
     /// Fully walkable grid of `size` x `size` cells (no reserved footprints).
     /// Used by simulation tests that need pathing without a real map file.
@@ -237,6 +299,42 @@ fn heuristic(a: IVec2, b: IVec2) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visibility_reveals_radius_and_preserves_explored_cells() {
+        let mut visibility = VisibilityGrid {
+            width: 11,
+            height: 11,
+            visible: vec![false; 121],
+            explored: vec![false; 121],
+        };
+        let scout = IVec2::new(5, 5);
+        visibility.reveal(scout, 3);
+
+        assert!(visibility.is_visible(scout));
+        assert!(visibility.is_visible(IVec2::new(8, 5)));
+        assert!(!visibility.is_visible(IVec2::new(8, 8)));
+        visibility.clear_visible();
+        assert!(!visibility.is_visible(scout));
+        assert!(visibility.is_explored(scout));
+    }
+
+    #[test]
+    fn enemy_and_neutral_entities_need_current_vision() {
+        let mut visibility = VisibilityGrid {
+            width: 3,
+            height: 3,
+            visible: vec![false; 9],
+            explored: vec![false; 9],
+        };
+        let cell = IVec2::new(1, 1);
+        assert!(visibility.entity_visible(Some(0), cell));
+        assert!(!visibility.entity_visible(Some(1), cell));
+        assert!(!visibility.entity_visible(None, cell));
+        visibility.reveal(cell, 0);
+        assert!(visibility.entity_visible(Some(1), cell));
+        assert!(visibility.entity_visible(None, cell));
+    }
 
     #[test]
     fn reserved_footprint_is_blocked_and_pathfinding_detours() {

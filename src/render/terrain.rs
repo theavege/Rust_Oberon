@@ -24,11 +24,13 @@ use bevy::prelude::*;
 use bevy::sprite::Anchor;
 
 use crate::core::gamestate::GameState;
+use crate::core::map::VisibilityGrid;
 
 /// One rendered fragment instance.
 #[derive(Component)]
 struct TerrainFragment {
     segment: usize,
+    cell: IVec2,
 }
 
 /// Per-texture-frame animation state attached to animated sprites.
@@ -205,6 +207,7 @@ pub fn spawn_terrain(
                 },
                 TerrainFragment {
                     segment: pf.segment,
+                    cell: IVec2::new(pf.x as i32, pf.y as i32),
                 },
             ));
         } else {
@@ -222,12 +225,30 @@ pub fn spawn_terrain(
                 Transform::from_xyz(pos.x, pos.y, 0.0),
                 TerrainFragment {
                     segment: pf.segment,
+                    cell: IVec2::new(pf.x as i32, pf.y as i32),
                 },
             ));
         }
     }
     info!("Terrain spawned: {} fragments", gs.map.fragments.len());
     *done = true;
+}
+
+/// Tint each fragment by its anchor cell: black for unexplored land, dim for
+/// remembered land, and normal color for currently visible terrain.
+fn apply_fog_to_terrain(
+    visibility: Res<VisibilityGrid>,
+    mut terrain: Query<(&TerrainFragment, &mut Sprite)>,
+) {
+    for (fragment, mut sprite) in &mut terrain {
+        sprite.color = if visibility.is_visible(fragment.cell) {
+            Color::WHITE
+        } else if visibility.is_explored(fragment.cell) {
+            Color::srgb(0.42, 0.42, 0.48)
+        } else {
+            Color::srgb(0.025, 0.03, 0.045)
+        };
+    }
 }
 
 /// Global animation tick (DO animates all scheme instances in lockstep via
@@ -272,6 +293,7 @@ impl Plugin for TerrainRenderPlugin {
             Update,
             (
                 spawn_terrain,
+                apply_fog_to_terrain,
                 animate_fragments,
                 apply_frame_indices.after(animate_fragments),
             )

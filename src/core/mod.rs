@@ -34,6 +34,7 @@ impl Plugin for CorePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<GameConfig>()
             .init_resource::<map::NavigationGrid>()
+            .init_resource::<map::VisibilityGrid>()
             .init_resource::<units::PlayerEconomy>()
             .init_resource::<units::ShedDefinition>()
             .init_resource::<units::CombatDefinition>()

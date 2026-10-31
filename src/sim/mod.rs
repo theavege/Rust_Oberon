@@ -10,7 +10,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::time::Duration;
 
 use crate::core::{
-    map::NavigationGrid,
+    map::{NavigationGrid, VisibilityGrid},
     units::{
         AttackCooldown, AttackOrder, Attacking, Building, CombatDefinition, ConstructionSite, Dead,
         HarvestOrder, Health, MovePath, Player, PlayerCommand, PlayerEconomy, ResourceNode,
@@ -66,8 +66,28 @@ impl Plugin for SimPlugin {
                     construction_system.after(harvest_system),
                     attack_system.after(construction_system),
                     death_system.after(attack_system),
+                    update_visibility.after(death_system),
                 ),
             );
+    }
+}
+
+/// Recompute current player vision after movement/combat; explored cells are
+/// deliberately retained by `VisibilityGrid`.
+fn update_visibility(
+    navigation: Res<NavigationGrid>,
+    mut visibility: ResMut<VisibilityGrid>,
+    scouts: Query<(&Player, &WorldPosition), With<Unit>>,
+) {
+    if visibility.width != navigation.width || visibility.height != navigation.height {
+        *visibility = VisibilityGrid::from_navigation(&navigation);
+    }
+    visibility.clear_visible();
+    const SCOUT_RADIUS: i32 = 8;
+    for (owner, position) in &scouts {
+        if owner.0 == 0 {
+            visibility.reveal(navigation.world_to_cell(position.0), SCOUT_RADIUS);
+        }
     }
 }
 
@@ -992,13 +1012,11 @@ fn opponent_ai_system(
         // unit. Deterministic tie-break (see `target_preference_key`): nearest
         // first, then earliest-spawned entity, so identical worlds always pick
         // the same target regardless of query iteration order.
-        let held_target = order
-            .map(|order| order.target)
-            .filter(|target| {
-                victims
-                    .get(*target)
-                    .is_ok_and(|(_, player, _, health)| player.0 != owner.0 && health.current > 0.0)
-            });
+        let held_target = order.map(|order| order.target).filter(|target| {
+            victims
+                .get(*target)
+                .is_ok_and(|(_, player, _, health)| player.0 != owner.0 && health.current > 0.0)
+        });
         let Some((target, target_position)) = held_target
             .and_then(|target| {
                 victims
@@ -1013,10 +1031,14 @@ fn opponent_ai_system(
                         victim_player.0 != owner.0 && health.current > 0.0
                     })
                     .min_by(|a, b| {
-                        let key_a =
-                            crate::core::units::target_preference_key(a.2 .0.distance(position.0), a.0);
-                        let key_b =
-                            crate::core::units::target_preference_key(b.2 .0.distance(position.0), b.0);
+                        let key_a = crate::core::units::target_preference_key(
+                            a.2 .0.distance(position.0),
+                            a.0,
+                        );
+                        let key_b = crate::core::units::target_preference_key(
+                            b.2 .0.distance(position.0),
+                            b.0,
+                        );
                         key_a
                             .0
                             .total_cmp(&key_b.0)
