@@ -974,35 +974,56 @@ fn opponent_ai_system(
         if owner.0 != 1 || !combat.can_attack(unit.kind) {
             continue;
         }
-        // Already ordered against a living enemy: keep the order even when
-        // no route exists right now — the unit holds its ground and the AI
-        // re-evaluates next tick — instead of ping-ponging targets forever.
-        if order.is_some_and(|order| {
+        // Already ordered against a living enemy: keep that target choice
+        // (no ping-ponging between candidates), but do not return early —
+        // the unit must keep re-routing toward the target until it is in
+        // range. An order assigned while out of reach with no path yet is
+        // otherwise inert: nothing else ever queues an approach for AI units,
+        // so they would stand still forever next to a distant victim. The
+        // routing block below runs every tick for ordered attackers too;
+        // once in range it simply clears any leftover movement route.
+        let already_ordered = order.is_some_and(|order| {
             victims
                 .get(order.target)
                 .is_ok_and(|(_, player, _, health)| player.0 != owner.0 && health.current > 0.0)
-        }) {
-            continue;
-        }
-        let Some((target, target_position)) = victims
-            .iter()
-            .filter(|(_, victim_player, _, health)| {
-                victim_player.0 != owner.0 && health.current > 0.0
+        });
+        // Keep an existing valid order's target choice; only re-acquire when
+        // the current order is missing or points at a friendly/dead/vanished
+        // unit. Deterministic tie-break (see `target_preference_key`): nearest
+        // first, then earliest-spawned entity, so identical worlds always pick
+        // the same target regardless of query iteration order.
+        let held_target = order
+            .map(|order| order.target)
+            .filter(|target| {
+                victims
+                    .get(*target)
+                    .is_ok_and(|(_, player, _, health)| player.0 != owner.0 && health.current > 0.0)
+            });
+        let Some((target, target_position)) = held_target
+            .and_then(|target| {
+                victims
+                    .get(target)
+                    .ok()
+                    .map(|(_, _, position, _)| (target, *position))
             })
-            // Deterministic tie-break (see `target_preference_key`): nearest
-            // first, then earliest-spawned entity, so identical worlds always
-            // pick the same target regardless of query iteration order.
-            .min_by(|a, b| {
-                let key_a =
-                    crate::core::units::target_preference_key(a.2 .0.distance(position.0), a.0);
-                let key_b =
-                    crate::core::units::target_preference_key(b.2 .0.distance(position.0), b.0);
-                key_a
-                    .0
-                    .total_cmp(&key_b.0)
-                    .then_with(|| key_a.1.cmp(&key_b.1).then_with(|| key_a.2.cmp(&key_b.2)))
+            .or_else(|| {
+                victims
+                    .iter()
+                    .filter(|(_, victim_player, _, health)| {
+                        victim_player.0 != owner.0 && health.current > 0.0
+                    })
+                    .min_by(|a, b| {
+                        let key_a =
+                            crate::core::units::target_preference_key(a.2 .0.distance(position.0), a.0);
+                        let key_b =
+                            crate::core::units::target_preference_key(b.2 .0.distance(position.0), b.0);
+                        key_a
+                            .0
+                            .total_cmp(&key_b.0)
+                            .then_with(|| key_a.1.cmp(&key_b.1).then_with(|| key_a.2.cmp(&key_b.2)))
+                    })
+                    .map(|(target, _, target_position, _)| (target, *target_position))
             })
-            .map(|(target, _, target_position, _)| (target, *target_position))
         else {
             continue;
         };
@@ -1033,7 +1054,17 @@ fn opponent_ai_system(
         } else {
             entity_commands.remove::<MovePath>();
         }
-        entity_commands.insert((AttackOrder { target }, AttackCooldown::default(), Attacking));
+        // A unit that already holds this exact live order keeps its cooldown
+        // clock (`AttackCooldown::default()` means "ready"), so the AI
+        // refreshing routing every tick must not reset it — otherwise the
+        // enemy would strike on *every* tick instead of once per cooldown.
+        let keep_clock = already_ordered;
+        if keep_clock {
+            entity_commands.insert(AttackOrder { target });
+        } else {
+            entity_commands.insert((AttackOrder { target }, AttackCooldown::default()));
+        }
+        entity_commands.insert(Attacking);
     }
 }
 
@@ -1339,24 +1370,24 @@ mod tests {
 
         test.send(PlayerCommand::Attack(target));
         // The order attaches when the command's deferred writes flush, at
-        // the end of the update that consumes the event — so the first
-        // strike happens on the *next* step, not the one the command was
-        // sent in. Step 1: order lands + first strike (100 -> 80, target
-        // sits inside melee range and fresh cooldowns start ready). The
-        // strike sets the clock to `cooldown - COOLDOWN_PHASE`; each later
-        // tick decays it by one step before the ready check, so exactly
-        // `cooldown / dt` ticks elapse between strikes: the second hit
-        // lands on step 21.
-        test.steps(20);
+        // the end of the update that consumes the event; the fixed combat
+        // systems of that same update never see it, so the first strike
+        // lands on the *second* step after `send`. Step 2: first hit
+        // (100 -> 80, target sits inside melee range and fresh cooldowns
+        // start ready). The strike sets the clock to `cooldown -
+        // COOLDOWN_PHASE`; each later tick decays it by one step before the
+        // ready check, so exactly `cooldown / dt` ticks elapse between
+        // strikes: the second hit lands 20 ticks after the first.
+        test.steps(2); // step 1: order lands, step 2: first strike
         assert_eq!(test.health(target), Some(80.0));
         assert!(test.cooldown(attacker).is_some());
 
         // Half a cooldown before the window closes: still only one hit.
-        test.steps(10);
+        test.steps(29); // 31 steps total, 19 ticks into the 20-tick cooldown
         assert_eq!(test.health(target), Some(80.0), "cooldown gates strikes");
 
         // One more tick takes the clock to zero: the second hit lands here.
-        test.step();
+        test.step(); // tick 20 after the first strike
         assert_eq!(test.health(target), Some(60.0));
     }
 
@@ -1370,10 +1401,11 @@ mod tests {
         let target = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 10.0, false);
 
         test.send(PlayerCommand::Attack(target));
-        // The order attaches when the first `update()` after `send()`
-        // flushes deferred writes; that update's fixed tick strikes (fresh
-        // cooldowns start ready), so health is 80 after one step.
-        test.step();
+        // The order attaches when the first `update()` after `send()` flushes
+        // its deferred writes; the *next* update's fixed tick is the first
+        // that sees the order and strikes (fresh cooldowns start ready), so
+        // health is 80 after two steps — same as with the default scale.
+        test.steps(2);
         assert_eq!(test.health(target), Some(80.0));
         test.steps(20); // one default (1 s) cooldown would have allowed a second hit
         assert_eq!(
@@ -1382,10 +1414,10 @@ mod tests {
             "scaled cooldown halves rate"
         );
         // The doubled cooldown is 2 s = 40 ticks; the strike cadence is
-        // exactly `cooldown / dt` ticks, so the second hit lands on step 41.
-        test.steps(20); // still cooling down at 40 ticks after the first hit
+        // exactly `cooldown / dt` ticks, so the second hit lands on step 42.
+        test.steps(19); // still cooling down at 40 ticks after the first hit
         assert_eq!(test.health(target), Some(80.0));
-        test.step(); // tick 41: the doubled cooldown (2 s) now allows the hit
+        test.step(); // tick 42: the doubled cooldown (2 s) now allows the hit
         assert_eq!(test.health(target), Some(60.0));
     }
 
@@ -1507,21 +1539,6 @@ mod tests {
     }
 
     #[test]
-    fn dbg_ai() {
-        let mut test = TestApp::new();
-        let victim = test.spawn_unit(UnitKind::Peasant, 0, Vec2::ZERO, false);
-        let enemy = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 380.0, false);
-        println!("victim={victim:?} enemy={enemy:?}");
-        let mut q = test.app.world().query::<(Entity, &crate::core::units::Player)>();
-        for (e, p) in q.iter(test.app.world()) {
-            println!("entity {e:?} player {p:?}");
-        }
-        for i in 0..4 {
-            test.step();
-            println!("step {i}: order={:?} pos={:?}", test.attack_target(enemy), test.position(enemy));
-        }
-    }
-    #[test]
     fn opponent_ai_moves_into_range_of_far_targets() {
         let mut test = TestApp::new();
         let victim = test.spawn_unit(UnitKind::Peasant, 0, Vec2::ZERO, false);
@@ -1531,8 +1548,11 @@ mod tests {
         // approach route toward it instead of rejecting the attack outright.
         let enemy = test.spawn_unit(UnitKind::Warrior, 1, Vec2::X * 380.0, false);
 
-        test.steps(2); // tick 1 assigns the order (deferred writes flush at
-                       // the end of that update; tick 2 proves it stuck)
+        // The AI's order arrives through deferred commands, which only become
+        // visible to direct world queries after the *next* `update()` flushes
+        // them: step 1 runs the AI system that assigns the order, step 2
+        // makes it observable (and proves it stuck).
+        test.steps(2);
         assert_eq!(test.attack_target(enemy), Some(victim));
         let moved = test.position(enemy).unwrap();
         test.steps(20);
